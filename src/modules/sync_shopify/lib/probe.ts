@@ -168,6 +168,19 @@ export async function probeConnection(input: ProbeInput): Promise<ProbeResult> {
     plan: shop?.plan?.displayName,
   }
 
+  // Shopify will happily answer on an alias, then report a different canonical domain. That
+  // canonical value is the store's stable identity — if two integrations reached the same store
+  // via different aliases we would treat them as different stores and duplicate every record.
+  const canonical = shop?.myshopifyDomain?.toLowerCase()
+  if (canonical && canonical !== shopDomain) {
+    steps.push({
+      name: 'Canonical domain',
+      status: 'warning',
+      detail: `connected as ${shopDomain}, store reports ${canonical}`,
+      hint: `Use ${canonical} as the configured shop domain. It is the store's permanent identity; the alias may change or be reassigned.`,
+    })
+  }
+
   // ── Step 4: scopes ─────────────────────────────────────────────────────────────────────────
   // Scopes are configured on the app, not requested per token, so a misconfigured app produces a
   // perfectly valid token that silently cannot read one entity type.
