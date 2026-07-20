@@ -38,7 +38,15 @@ const LOOKUP_INDEX = 'sync_shopify_inventory_snapshots_lookup_idx'
 // The exact shape of the `oosRatio` lookup: scope first, then variant, then the date range scan.
 @Index({ name: LOOKUP_INDEX, properties: ['organizationId', 'tenantId', 'variantExternal', 'snapshotDate'] })
 export class ShopifyInventorySnapshot {
-  [OptionalProps]?: 'variantId' | 'sku' | 'productType' | 'committed' | 'incoming' | 'createdAt' | 'updatedAt'
+  [OptionalProps]?:
+    | 'variantId'
+    | 'sku'
+    | 'productType'
+    | 'productStatus'
+    | 'committed'
+    | 'incoming'
+    | 'createdAt'
+    | 'updatedAt'
 
   @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
   id!: string

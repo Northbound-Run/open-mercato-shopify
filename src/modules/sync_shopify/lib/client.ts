@@ -46,7 +46,24 @@ export type GraphQLRequestOptions = {
   /** Estimated cost, used to pace *before* sending. Optional but improves smoothing. */
   estimatedCost?: number
   signal?: AbortSignal
+  /**
+   * Extra request headers.
+   *
+   * Exists chiefly for `SEARCH_DEBUG_HEADER`: Shopify only populates `extensions.search` when the
+   * request asks for it, so without this the R-13 detection is wired but permanently silent.
+   */
+  headers?: Record<string, string>
 }
+
+/**
+ * Ask Shopify to report how it interpreted a `query:` filter.
+ *
+ * R-13: an invalid search field is **ignored**, and the connection returns everything — a delta run
+ * silently degrades into a full scan while still returning correct-looking data. The only signal is
+ * `extensions.search[].warnings`, and Shopify emits it solely when this header is present. Any
+ * adapter issuing a filtered query should send it and assert the warnings are empty.
+ */
+export const SEARCH_DEBUG_HEADER = { 'Shopify-Search-Query-Debug': '1' } as const
 
 export class ShopifyApiError extends Error {
   readonly code: string
@@ -133,7 +150,7 @@ export function createShopifyClient(options: ShopifyClientOptions): ShopifyClien
     query: string,
     requestOptions: GraphQLRequestOptions = {},
   ): Promise<DetailedResponse<TData>> {
-    const { variables, estimatedCost, signal } = requestOptions
+    const { variables, estimatedCost, signal, headers } = requestOptions
     let lastCost: QueryCost | null = null
     let tokenRetried = false
 
@@ -147,7 +164,9 @@ export function createShopifyClient(options: ShopifyClientOptions): ShopifyClien
       const token = await options.tokenProvider.getToken()
       const response = await clientFor(token.accessToken).request<TData>(
         query,
-        variables ? { variables } : undefined,
+        variables || headers
+          ? { ...(variables ? { variables } : {}), ...(headers ? { headers } : {}) }
+          : undefined,
       )
 
       lastCost = parseCost(response.extensions)
