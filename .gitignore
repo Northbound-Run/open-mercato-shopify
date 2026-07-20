@@ -14,3 +14,5 @@ coverage/
 # OMC tooling session state (plans are kept, state is not)
 .omc/state/
 .omc/**/.omc/
+**/.omc/state/
+src/**/.omc/
