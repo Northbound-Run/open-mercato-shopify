@@ -6,7 +6,7 @@ import type {
   StreamImportInput,
   TenantScope,
 } from '@open-mercato/core/modules/data_sync/lib/adapter'
-import type { ShopifyClient } from '../client'
+import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../client'
 import type { BulkExport, BulkNode } from '../bulk'
 import { childrenOfType, runBulkExport } from '../bulk'
 import {
@@ -18,7 +18,13 @@ import {
   OM_ENTITY_ID,
   PROVIDER_KEY,
 } from '../constants'
-import { advanceCursor, parseCursor, serializeCursor, type ShopifyCursorState } from '../cursor'
+import {
+  advanceCursor,
+  normalizeTimestamp,
+  parseCursor,
+  serializeCursor,
+  type ShopifyCursorState,
+} from '../cursor'
 import { toImportItem, type CommandBusPort, type EntityRow, type EntityWriter } from '../writer'
 import {
   customerContentHash,
@@ -238,15 +244,111 @@ const CUSTOMERS_DELTA_QUERY = `#graphql
  * Exported so a test can assert on the exact string. That matters more than it looks: **an invalid
  * search field is IGNORED and Shopify returns everything** — *"If you specify an invalid field,
  * then the query is ignored and all results are returned"* — so a typo here does not error, it
- * turns every delta run into a full scan that still reports success. Shopify surfaces this on
- * `extensions.search[].warnings`, which `ShopifyClient.request` does not currently expose, so
- * pinning the built string is the check available to us.
+ * turns every delta run into a full scan that still reports success. Shopify surfaces the fault on
+ * `extensions.search[].warnings`, which the delta path now reads via `requestDetailed` +
+ * `SEARCH_DEBUG_HEADER` (see `assertSearchWarningsEmpty`); pinning the built string is the second,
+ * header-independent check.
  *
  * The timestamp is single-quoted because an unquoted one is parsed as several terms.
  */
 export function buildUpdatedAtFilter(updatedAfter: string | null): string | null {
   if (!updatedAfter) return null
   return `updated_at:>'${updatedAfter}'`
+}
+
+// ── R-13: the silently-ignored search filter ─────────────────────────────────────────────────
+
+/**
+ * A run-level fault, thrown to ABORT the run rather than degrade it.
+ *
+ * Distinct from a per-item failure: a poisoned delta filter is not one customer's problem, it is
+ * every customer's, so it must stop the run instead of being tallied as one failed item. It throws
+ * OUT of `streamImport` (outside the per-item containment), and the engine finalises the run as
+ * failed — which for a PII entity silently full-scanning is the correct, loud outcome.
+ */
+export class CustomersSyncError extends Error {
+  constructor(
+    readonly code: 'search_filter_ignored',
+    message: string,
+  ) {
+    super(message)
+    this.name = 'CustomersSyncError'
+  }
+}
+
+/**
+ * Pull Shopify's search warnings out of a response's `extensions` envelope.
+ *
+ * When Shopify ignores a filter it says so in `extensions.search[].warnings` — never as an error —
+ * so a warning here means the delta window was discarded and this "incremental" run is really a
+ * full scan. Written defensively enough to survive whatever shape the envelope turns out to have:
+ * a warning may be a bare string or a `{ field, message }` object.
+ *
+ * PII-safe by construction: these warnings describe the QUERY (`updated_at:>'…'`, a timestamp),
+ * never customer data, so the strings collected here carry no personal information.
+ */
+export function readSearchWarnings(extensions: Record<string, unknown> | undefined): string[] {
+  const search = extensions?.search
+  if (!Array.isArray(search)) return []
+
+  const warnings: string[] = []
+  for (const entry of search) {
+    const raw = (entry as Record<string, unknown> | null)?.warnings
+    if (!Array.isArray(raw)) continue
+    for (const warning of raw) {
+      if (typeof warning === 'string') {
+        warnings.push(warning)
+        continue
+      }
+      const record = warning as Record<string, unknown> | null
+      const message = typeof record?.message === 'string' ? record.message : null
+      const field = typeof record?.field === 'string' ? record.field : null
+      if (message || field) warnings.push([field, message].filter(Boolean).join(': '))
+    }
+  }
+  return warnings
+}
+
+/**
+ * The direct R-13 defence: abort if Shopify reports it ignored the filter.
+ *
+ * Only meaningful when the request sent `SEARCH_DEBUG_HEADER` AND carried a filter — Shopify
+ * populates `extensions.search` solely when asked, so the caller gates this on `filter` being set.
+ */
+export function assertSearchWarningsEmpty(extensions: Record<string, unknown> | undefined): void {
+  const warnings = readSearchWarnings(extensions)
+  if (warnings.length === 0) return
+  throw new CustomersSyncError(
+    'search_filter_ignored',
+    `[internal] Shopify reported search warnings for the customer delta query: ${JSON.stringify(warnings)}; ` +
+      'an unrecognised field is ignored rather than rejected, so this run would rescan every customer',
+  )
+}
+
+/**
+ * The second, header-independent belt: abort if any returned row predates the window we asked for.
+ *
+ * `assertSearchWarningsEmpty` depends on a header Shopify only honours when asked; this one needs
+ * no cooperation at all. A customer older than `updatedAfter` in a filtered response is proof the
+ * filter was ignored in effect even if it was accepted in form. Embeds only the customer GID and a
+ * timestamp — never PII.
+ */
+export function assertDeltaWindowRespected(
+  nodes: ShopifyCustomerNode[],
+  updatedAfter: string,
+): void {
+  const floor = Date.parse(updatedAfter)
+  if (!Number.isFinite(floor)) return
+  for (const node of nodes) {
+    const seen = normalizeTimestamp(node.updatedAt)
+    if (seen !== null && Date.parse(seen) < floor) {
+      throw new CustomersSyncError(
+        'search_filter_ignored',
+        `[internal] customer delta asked for updated_at > ${updatedAfter} but Shopify returned ` +
+          `${node.id} updated at ${seen}; the filter was ignored and this run would rescan every customer`,
+      )
+    }
+  }
 }
 
 // ── Payload normalisation ────────────────────────────────────────────────────────────────────
@@ -632,15 +734,33 @@ export function createCustomersAdapter(options: CustomersAdapterOptions): DataSy
       let after = state?.kind === 'paging' ? state.endCursor : null
 
       for (;;) {
-        const data = await runtime.client.request<DeltaResponse>(CUSTOMERS_DELTA_QUERY, {
-          variables: { first: pageSize, after, query: filter, addresses: addressPageSize },
-          estimatedCost: pageSize,
-        })
+        // `requestDetailed`, not `request`: the `extensions` envelope carries `search[].warnings`,
+        // the only signal that Shopify silently ignored the filter. `SEARCH_DEBUG_HEADER` is what
+        // makes Shopify populate it — without the header the check below is wired but permanently
+        // silent. Harmless when `filter` is null; it just has nothing to report.
+        const { data, extensions } = await runtime.client.requestDetailed<DeltaResponse>(
+          CUSTOMERS_DELTA_QUERY,
+          {
+            variables: { first: pageSize, after, query: filter, addresses: addressPageSize },
+            estimatedCost: pageSize,
+            headers: SEARCH_DEBUG_HEADER,
+          },
+        )
 
         const edges = data?.customers?.edges ?? []
-        for (const edge of edges) {
-          if (edge?.node) await handle(edge.node)
-        }
+        const nodes = edges
+          .map((edge) => edge?.node)
+          .filter((node): node is ShopifyCustomerNode => node != null)
+
+        // 🔴 R-13, asserted BEFORE any write: a typo'd `updated_at` is ignored, not rejected, and
+        // Shopify returns the WHOLE customer base — a silent full scan of a PII entity, the worst
+        // runaway to have. Abort loudly rather than deactivate half the base on the reconcile that
+        // a "complete-looking" full scan would trigger. Guarded on `filter` because an unfiltered
+        // page (no watermark yet) has nothing to warn about.
+        if (filter) assertSearchWarningsEmpty(extensions)
+        if (updatedAfter) assertDeltaWindowRespected(nodes, updatedAfter)
+
+        for (const node of nodes) await handle(node)
 
         const pageInfo = data?.customers?.pageInfo
         const endCursor = pageInfo?.endCursor ?? null

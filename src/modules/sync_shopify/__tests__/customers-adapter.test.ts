@@ -1,14 +1,18 @@
 import type { ImportBatch, StreamImportInput } from '@open-mercato/core/modules/data_sync/lib/adapter'
 import type { BulkExport, BulkNode } from '../lib/bulk'
-import type { ShopifyClient } from '../lib/client'
+import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../lib/client'
 import { COMMAND, COMMAND_RESULT_KEY, ENTITY_TYPE, MAPPING_ENTITY_TYPE, PROVIDER_KEY } from '../lib/constants'
 import { parseCursor, serializeCursor } from '../lib/cursor'
 import { createEntityWriter, type CommandBusPort, type EntityRow, type FindOnePort } from '../lib/writer'
 import {
+  assertDeltaWindowRespected,
+  assertSearchWarningsEmpty,
   buildUpdatedAtFilter,
   bulkNodeToCustomer,
   buildCustomerBulkQuery,
   createCustomersAdapter,
+  CustomersSyncError,
+  readSearchWarnings,
   type CustomerSyncLogEvent,
   type CustomerSyncRuntime,
 } from '../lib/adapters/customers'
@@ -363,8 +367,11 @@ describe('full-sync reconciliation, and the guard that stops a delta doing it', 
       return [{ localId: 'cust-untouched', externalId: 'gid://shopify/Customer/9999' }]
     }
     harness.runtime.client = {
-      request: async () => ({
-        customers: { edges: [{ node: customerNode() }], pageInfo: { hasNextPage: false, endCursor: null } },
+      requestDetailed: async () => ({
+        data: {
+          customers: { edges: [{ node: customerNode() }], pageInfo: { hasNextPage: false, endCursor: null } },
+        },
+        extensions: undefined,
       }),
     } as unknown as ShopifyClient
 
@@ -385,7 +392,10 @@ describe('full-sync reconciliation, and the guard that stops a delta doing it', 
       owned: { [`${MAPPING_ENTITY_TYPE.customerEntity}::cust-untouched`]: 'gid://shopify/Customer/9999' },
     })
     harness.runtime.client = {
-      request: async () => ({ customers: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } } }),
+      requestDetailed: async () => ({
+        data: { customers: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } } },
+        extensions: undefined,
+      }),
     } as unknown as ShopifyClient
 
     await runAdapter(harness, [], { cursor: 'not-json-at-all' })
@@ -597,22 +607,33 @@ describe('PII containment', () => {
 })
 
 describe('delta path', () => {
-  function deltaHarness(pages: { node: ShopifyCustomerNode }[][]) {
+  function deltaHarness(
+    pages: { node: ShopifyCustomerNode }[][],
+    opts: { extensions?: Record<string, unknown> } = {},
+  ) {
     const harness = makeHarness()
     const requests: Record<string, unknown>[] = []
+    const headers: (Record<string, string> | undefined)[] = []
     let page = 0
     harness.runtime.client = {
-      request: async (_query: string, requestOptions?: { variables?: Record<string, unknown> }) => {
+      requestDetailed: async (
+        _query: string,
+        requestOptions?: { variables?: Record<string, unknown>; headers?: Record<string, string> },
+      ) => {
         requests.push(requestOptions?.variables ?? {})
+        headers.push(requestOptions?.headers)
         const edges = pages[page] ?? []
         const hasNextPage = page < pages.length - 1
         page += 1
         return {
-          customers: { edges, pageInfo: { hasNextPage, endCursor: hasNextPage ? `cursor-${page}` : null } },
+          data: {
+            customers: { edges, pageInfo: { hasNextPage, endCursor: hasNextPage ? `cursor-${page}` : null } },
+          },
+          extensions: opts.extensions,
         }
       },
     } as unknown as ShopifyClient
-    return { harness, requests }
+    return { harness, requests, headers }
   }
 
   it('filters on updated_at and pairs it with the matching sort key', async () => {
