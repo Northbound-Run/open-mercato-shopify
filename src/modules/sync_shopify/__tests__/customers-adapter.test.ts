@@ -228,6 +228,40 @@ function runAdapter(
   return collect(adapter.streamImport!(importInput(input)))
 }
 
+/**
+ * A delta-path harness: stubs `requestDetailed` (not `request` — the R-13 guard needs the
+ * `extensions` envelope), records the variables and headers each page was requested with, and lets
+ * a test inject the `extensions` Shopify would return.
+ */
+function deltaHarness(
+  pages: { node: ShopifyCustomerNode }[][],
+  opts: { extensions?: Record<string, unknown> } = {},
+) {
+  const harness = makeHarness()
+  const requests: Record<string, unknown>[] = []
+  const headers: (Record<string, string> | undefined)[] = []
+  let page = 0
+  harness.runtime.client = {
+    requestDetailed: async (
+      _query: string,
+      requestOptions?: { variables?: Record<string, unknown>; headers?: Record<string, string> },
+    ) => {
+      requests.push(requestOptions?.variables ?? {})
+      headers.push(requestOptions?.headers)
+      const edges = pages[page] ?? []
+      const hasNextPage = page < pages.length - 1
+      page += 1
+      return {
+        data: {
+          customers: { edges, pageInfo: { hasNextPage, endCursor: hasNextPage ? `cursor-${page}` : null } },
+        },
+        extensions: opts.extensions,
+      }
+    },
+  } as unknown as ShopifyClient
+  return { harness, requests, headers }
+}
+
 describe('adapter shape', () => {
   it('declares the identifiers the sync engine resolves it by', () => {
     const adapter = createCustomersAdapter({ createRuntime: async () => makeHarness().runtime })
@@ -607,35 +641,6 @@ describe('PII containment', () => {
 })
 
 describe('delta path', () => {
-  function deltaHarness(
-    pages: { node: ShopifyCustomerNode }[][],
-    opts: { extensions?: Record<string, unknown> } = {},
-  ) {
-    const harness = makeHarness()
-    const requests: Record<string, unknown>[] = []
-    const headers: (Record<string, string> | undefined)[] = []
-    let page = 0
-    harness.runtime.client = {
-      requestDetailed: async (
-        _query: string,
-        requestOptions?: { variables?: Record<string, unknown>; headers?: Record<string, string> },
-      ) => {
-        requests.push(requestOptions?.variables ?? {})
-        headers.push(requestOptions?.headers)
-        const edges = pages[page] ?? []
-        const hasNextPage = page < pages.length - 1
-        page += 1
-        return {
-          data: {
-            customers: { edges, pageInfo: { hasNextPage, endCursor: hasNextPage ? `cursor-${page}` : null } },
-          },
-          extensions: opts.extensions,
-        }
-      },
-    } as unknown as ShopifyClient
-    return { harness, requests, headers }
-  }
-
   it('filters on updated_at and pairs it with the matching sort key', async () => {
     const { harness, requests } = deltaHarness([[{ node: customerNode() }]])
     const cursor = serializeCursor({ kind: 'idle', updatedAfter: '2026-07-01T00:00:00.000Z' })
@@ -687,6 +692,120 @@ describe('delta path', () => {
       cursor: serializeCursor({ kind: 'idle', updatedAfter: '2026-07-01T00:00:00.000Z' }),
     })
     expect(requests[0].first).toBe(250)
+  })
+
+  it('sends the search-debug header so Shopify populates the R-13 warnings', async () => {
+    // Without the header, `extensions.search` is never populated and the warning guard passes
+    // vacuously forever. The header is the thing that makes the check live.
+    const { harness, headers } = deltaHarness([[{ node: customerNode() }]])
+    await runAdapter(harness, [], {
+      cursor: serializeCursor({ kind: 'idle', updatedAfter: '2026-07-01T00:00:00.000Z' }),
+    })
+    expect(headers[0]).toEqual(SEARCH_DEBUG_HEADER)
+  })
+})
+
+describe('R-13 — a silently-ignored search filter aborts the run', () => {
+  const withWatermark = serializeCursor({ kind: 'idle', updatedAfter: '2026-07-01T00:00:00.000Z' })
+
+  it('throws — not proceeds — when Shopify reports the filter was ignored', async () => {
+    // A typo'd `updated_at` is IGNORED and the whole customer base comes back. For a PII entity a
+    // silent full scan is the worst runaway: it looks like a complete sync and would drive the
+    // reconcile into deactivating everyone the "delta" didn't happen to include. Halt loudly.
+    const { harness } = deltaHarness([[{ node: customerNode() }]], {
+      extensions: { search: [{ warnings: [{ field: 'updated_at', message: 'is not a valid field' }] }] },
+    })
+    await expect(runAdapter(harness, [], { cursor: withWatermark })).rejects.toBeInstanceOf(CustomersSyncError)
+  })
+
+  it('writes nothing before aborting on a warning', async () => {
+    // The guard runs BEFORE any customer is handled, so a poisoned scan never touches the database.
+    const { harness } = deltaHarness([[{ node: customerNode() }]], {
+      extensions: { search: [{ warnings: ['updated_at ignored'] }] },
+    })
+    await expect(runAdapter(harness, [], { cursor: withWatermark })).rejects.toBeInstanceOf(CustomersSyncError)
+    expect(harness.commandCalls).toHaveLength(0)
+  })
+
+  it('catches a filter ignored in effect even when no warning is emitted (header-independent belt)', async () => {
+    // Second belt: a returned row older than the window we asked for proves the filter was ignored,
+    // regardless of whether Shopify emitted a warning.
+    const { harness } = deltaHarness([[{ node: customerNode({ updatedAt: '2020-01-01T00:00:00Z' }) }]])
+    await expect(runAdapter(harness, [], { cursor: withWatermark })).rejects.toBeInstanceOf(CustomersSyncError)
+    expect(harness.commandCalls).toHaveLength(0)
+  })
+
+  it('proceeds normally when warnings are empty and the window is respected', async () => {
+    const { harness } = deltaHarness([[{ node: customerNode() }]], { extensions: { search: [{ warnings: [] }] } })
+    const batches = await runAdapter(harness, [], { cursor: withWatermark })
+    const items = batches.flatMap((batch) => batch.items) as { action: string }[]
+    expect(items[0].action).toBe('create')
+  })
+
+  it('does NOT check warnings on an unfiltered delta page, even if extensions carry them', async () => {
+    // No watermark yet → no filter sent → there is nothing for Shopify to have ignored. The header
+    // is still sent (harmless), but the assertion is gated on a filter actually being present.
+    const { harness } = deltaHarness([[{ node: customerNode() }]], {
+      extensions: { search: [{ warnings: ['this must be ignored — no filter was sent'] }] },
+    })
+    const batches = await runAdapter(harness, [], {
+      cursor: serializeCursor({ kind: 'idle', updatedAfter: null }),
+    })
+    const items = batches.flatMap((batch) => batch.items) as { action: string }[]
+    expect(items[0].action).toBe('create')
+  })
+
+  it('does not run either guard on the backfill path', async () => {
+    // Backfill is a bulk operation, not a filtered `query:` — R-13 does not apply, and the guards
+    // must not fire on it. A full sync (no cursor) that would otherwise trip the window belt imports
+    // cleanly.
+    const harness = makeHarness()
+    const batches = await runAdapter(harness, [customerNode({ updatedAt: '2020-01-01T00:00:00Z' })])
+    const items = batches.flatMap((batch) => batch.items) as { action: string }[]
+    expect(items[0].action).toBe('create')
+  })
+})
+
+describe('R-13 helpers', () => {
+  it('reads warnings whether they are bare strings or {field,message} objects', () => {
+    expect(readSearchWarnings({ search: [{ warnings: ['plain warning'] }] })).toEqual(['plain warning'])
+    expect(
+      readSearchWarnings({ search: [{ warnings: [{ field: 'updated_at', message: 'unknown field' }] }] }),
+    ).toEqual(['updated_at: unknown field'])
+  })
+
+  it('returns nothing for a clean or malformed envelope', () => {
+    expect(readSearchWarnings(undefined)).toEqual([])
+    expect(readSearchWarnings({})).toEqual([])
+    expect(readSearchWarnings({ search: [{ warnings: [] }] })).toEqual([])
+    expect(readSearchWarnings({ search: 'not-an-array' })).toEqual([])
+  })
+
+  it('assertSearchWarningsEmpty throws only on a non-empty warning', () => {
+    expect(() => assertSearchWarningsEmpty({ search: [{ warnings: [] }] })).not.toThrow()
+    expect(() => assertSearchWarningsEmpty({ search: [{ warnings: ['ignored'] }] })).toThrow(CustomersSyncError)
+  })
+
+  it('assertDeltaWindowRespected throws only when a row predates the floor', () => {
+    const floor = '2026-07-01T00:00:00.000Z'
+    expect(() => assertDeltaWindowRespected([{ id: 'gid://shopify/Customer/1', updatedAt: '2026-07-05T00:00:00Z' }], floor)).not.toThrow()
+    expect(() => assertDeltaWindowRespected([{ id: 'gid://shopify/Customer/1', updatedAt: '2020-01-01T00:00:00Z' }], floor)).toThrow(
+      CustomersSyncError,
+    )
+    // A row with no timestamp is not evidence either way — do not throw on it.
+    expect(() => assertDeltaWindowRespected([{ id: 'gid://shopify/Customer/1' }], floor)).not.toThrow()
+  })
+
+  it('the abort message names the query fault, never customer data', () => {
+    // The error lands in the run log. It must explain the fault (rescan risk) with only the query
+    // field and GIDs — never a name, email, phone or address.
+    try {
+      assertSearchWarningsEmpty({ search: [{ warnings: ['updated_at is not a valid field'] }] })
+      throw new Error('expected a throw')
+    } catch (error) {
+      expect(error).toBeInstanceOf(CustomersSyncError)
+      expect((error as CustomersSyncError).message).toMatch(/rescan every customer/)
+    }
   })
 })
 
