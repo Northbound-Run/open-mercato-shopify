@@ -1,7 +1,12 @@
 import type { IntegrationScope } from '@open-mercato/shared/modules/integrations/types'
-import { BUNDLE_ID, DEFAULT_API_VERSION } from './lib/constants'
+import {
+  BUNDLE_ID,
+  DEFAULT_API_VERSION,
+  INVENTORY_DAILY_RETENTION_DAYS,
+} from './lib/constants'
 import { formatProbeResult, probeConnection } from './lib/probe'
 import { applyShopifyEnvPreset, ENV_KEYS } from './lib/preset'
+import { addDays, snapshotDateFor } from './lib/inventory-history'
 
 /**
  * Module CLI, discovered by `yarn generate` and dispatched as:
@@ -171,6 +176,87 @@ const configureFromEnv: ModuleCli = {
   },
 }
 
+/**
+ * Retention for the inventory snapshot table.
+ *
+ * Deliberately manual and dry-run by default. Inventory history cannot be re-fetched — Shopify has
+ * no way to backfill it — so a deleted row is gone permanently, and this is the only destructive
+ * operation in the connector. Nothing prunes on a schedule; an operator asks for it, sees what
+ * would go, then confirms.
+ */
+const pruneInventory: ModuleCli = {
+  command: 'prune-inventory',
+  async run(argv) {
+    const flags = parseArgs(argv)
+    const tenantId = str(flags.tenant) || str(flags['tenant-id'])
+    const organizationId = str(flags.org) || str(flags['organization-id'])
+    if (!tenantId || !organizationId) {
+      console.error('\n  ✗ --tenant and --org are required.\n')
+      process.exitCode = 1
+      return
+    }
+
+    const olderThanDays = Number(str(flags['older-than-days']) || INVENTORY_DAILY_RETENTION_DAYS)
+    if (!Number.isFinite(olderThanDays) || olderThanDays < 1) {
+      console.error('\n  ✗ --older-than-days must be a positive number.\n')
+      process.exitCode = 1
+      return
+    }
+    const confirmed = flags.confirm === true || str(flags.confirm) === 'true'
+
+    const { createRequestContainer } = await import('@open-mercato/shared/lib/di/container')
+    const container = await createRequestContainer()
+    try {
+      const em = container.resolve('em') as {
+        count(entity: unknown, where: Record<string, unknown>): Promise<number>
+        nativeDelete(entity: unknown, where: Record<string, unknown>): Promise<number>
+        findOne(
+          entity: unknown,
+          where: Record<string, unknown>,
+          options?: Record<string, unknown>,
+        ): Promise<{ snapshotDate?: string } | null>
+      }
+      const { ShopifyInventorySnapshot } = await import('./data/entities')
+
+      // The cutoff is inclusive of today, so exactly `olderThanDays` calendar days survive.
+      const cutoff = addDays(snapshotDateFor(new Date(), 'UTC'), -(olderThanDays - 1))
+      const scoped = { organizationId, tenantId }
+      const doomed = { ...scoped, snapshotDate: { $lt: cutoff } }
+
+      const [total, toDelete, oldest] = await Promise.all([
+        em.count(ShopifyInventorySnapshot, scoped),
+        em.count(ShopifyInventorySnapshot, doomed),
+        em.findOne(ShopifyInventorySnapshot, scoped, { orderBy: { snapshotDate: 'ASC' } }),
+      ])
+
+      console.log(`\n  Inventory snapshot retention (tenant ${tenantId})\n`)
+      console.log(`    rows total        ${total}`)
+      console.log(`    oldest snapshot   ${oldest?.snapshotDate ?? '(none)'}`)
+      console.log(`    keeping on/after  ${cutoff}  (${olderThanDays} days)`)
+      console.log(`    would delete      ${toDelete}`)
+
+      if (toDelete === 0) {
+        console.log('\n  Nothing to prune.\n')
+        return
+      }
+      if (!confirmed) {
+        // Never delete without an explicit second step — this data is unrecoverable.
+        console.log('\n  Dry run. Re-run with --confirm to delete permanently.')
+        console.log('  This history cannot be re-fetched from Shopify.\n')
+        return
+      }
+
+      const deleted = await em.nativeDelete(ShopifyInventorySnapshot, doomed)
+      console.log(`\n  ✓ Deleted ${deleted} snapshot row(s) older than ${cutoff}.\n`)
+    } catch (error) {
+      console.error(`\n  ✗ ${error instanceof Error ? error.message : String(error)}\n`)
+      process.exitCode = 1
+    } finally {
+      await (container as unknown as { dispose?: () => Promise<void> }).dispose?.()
+    }
+  },
+}
+
 const help: ModuleCli = {
   command: 'help',
   run() {
@@ -194,11 +280,19 @@ sync_shopify — Shopify sync for Open Mercato
   yarn mercato sync_shopify configure-from-env --tenant <id> --org <id>
       Seed stored credentials from environment variables. Never overwrites existing values.
 
+  yarn mercato sync_shopify prune-inventory --tenant <id> --org <id> [flags]
+      Delete inventory snapshot rows older than the retention window. Nothing prunes
+      automatically — inventory history cannot be re-fetched from Shopify, so deletion
+      is always an explicit operator action.
+
+      --older-than-days <n>    retention window, default ${INVENTORY_DAILY_RETENTION_DAYS}
+      --confirm                actually delete; without it this is a dry run
+
   yarn mercato sync_shopify help
 `)
   },
 }
 
-export const cli: ModuleCli[] = [testConnection, configureFromEnv, help]
+export const cli: ModuleCli[] = [testConnection, configureFromEnv, pruneInventory, help]
 
 export default cli
