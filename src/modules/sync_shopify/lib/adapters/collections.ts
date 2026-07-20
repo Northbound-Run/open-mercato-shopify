@@ -7,7 +7,7 @@ import type {
   TenantScope,
   ValidationResult,
 } from '@open-mercato/core/modules/data_sync/lib/adapter'
-import type { ShopifyClient } from '../client'
+import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../client'
 import type { BulkAnomaly, BulkExportOptions, BulkNode, BulkOperation } from '../bulk'
 import {
   bulkResultUrl,
@@ -110,9 +110,14 @@ const MAX_REPORTED_ANOMALIES = 10
  * Scalar fields, shared by the bulk and delta queries so the two paths cannot drift into mapping
  * different things.
  *
- * `descriptionHtml`, not `body`/`bodyHtml` — those are long deprecated. `sortOrder` and the SEO
- * fields are read but not stored: Open Mercato's category has no equivalent column, and
- * `categoryCreateSchema` accepts nothing beyond name/slug/description/parentId/isActive.
+ * `descriptionHtml`, not `body`/`bodyHtml` — those are long deprecated. All five are current in
+ * 2026-07 (`title: String!`, `handle: String!`, `descriptionHtml: HTML!`, `updatedAt: DateTime!`).
+ *
+ * `sortOrder`, `seo`, `image`, `productsCount` and `templateSuffix` are all available and all
+ * deliberately UNREQUESTED: `categoryCreateSchema` accepts nothing beyond
+ * name/slug/description/parentId/isActive, so there is nowhere to put them. `getMapping` declares
+ * the notable ones as `ignore` rather than omitting them, because "we looked and chose not to" is a
+ * different statement from "we never looked".
  */
 const COLLECTION_SCALAR_FIELDS = `
     id
@@ -126,18 +131,26 @@ const COLLECTION_SCALAR_FIELDS = `
  * How we ask whether Shopify computes this collection's membership.
  *
  * Verified against the 2026-07 schema: `sources: [CollectionSource!]!` — a plain non-null LIST (not
- * a connection, so it adds nothing to the bulk query's connection budget) of an INTERFACE, whose
- * implementations include `CollectionSourceManual`, `CollectionSourceInclusion` and
- * `CollectionSourceExclusion`. `__typename` needs no inline fragment on an interface, which is why
- * it can be selected on its own.
+ * a connection, so it adds nothing to the bulk query's connection budget and inlines straight into
+ * the parent JSONL record) of an INTERFACE with two implementations, `CollectionConditionsSource`
+ * and `CollectionSubCollectionsSource`. `__typename` needs no inline fragment on an interface,
+ * which is why it can be selected on its own.
  *
- * And on its own is deliberately all we select. The rules themselves are not modelled because they
- * cannot be honoured (see the note in `mappers/collection.ts`), so every additional subfield named
- * here would buy nothing while adding one more field that a quarterly release can rename out from
- * under us — and an unknown field is a hard GraphQL error that fails the whole sync.
+ * And on its own is deliberately all we select, for two reasons beyond economy:
+ *
+ *  - The definitions cannot be honoured (see the note in `mappers/collection.ts`), so richer
+ *    selections buy nothing but expose more field names to a quarterly rename — and an unknown
+ *    field is a hard GraphQL error that fails the whole sync.
+ *  - Reading the interesting parts (`inclusion`, `exclusion`, `collections`) requires INLINE
+ *    FRAGMENTS on an interface, and nothing in Shopify's docs confirms the bulk-operation validator
+ *    accepts those. The documented "must implement Node" rule covers connections, and `sources` is
+ *    not one, so the case is simply unaddressed either way. `__typename` alone sidesteps the
+ *    question entirely. Anyone tempted to expand this should first validate it with a throwaway
+ *    `bulkOperationRunQuery` against a dev store — `userErrors` comes back synchronously, so the
+ *    check is cheap.
  *
  * Isolated in one constant because R-3 asks for collection reads to sit behind a single seam. If a
- * future release rejects this selection, blanking this constant costs only the "rules are not
+ * future release rejects this selection, blanking this constant costs only the "definitions are not
  * preserved" diagnostic; nothing else in the adapter reads it.
  */
 const COLLECTION_SOURCE_FIELDS = `
@@ -235,11 +248,10 @@ export function buildUpdatedAtFilter(updatedAfter: string | null): string | null
  * discarded and this "incremental" run is really a full scan. That matters beyond the cost: a full
  * scan down the PAGING path saturates at 25,001 objects and truncates without complaint.
  *
- * ⚠️ INCOMPLETE BY DEPENDENCY. Shopify only populates `extensions.search` when the request carries
- * `Shopify-Search-Query-Debug: 1`, and `GraphQLRequestOptions` has no way to set a header today.
- * Until `client.ts` gains one this parses correctly and simply finds nothing — so it is a live
- * check the moment the header lands, and not a check that silently passes for a reason nobody
- * recorded. Written defensively enough to survive whatever shape the envelope turns out to have.
+ * Shopify only populates `extensions.search` when the request carries `Shopify-Search-Query-Debug`,
+ * which the delta request now sends via `SEARCH_DEBUG_HEADER`. This is therefore a live check, not
+ * one that passes vacuously. Written defensively enough to survive whatever shape the envelope
+ * turns out to have.
  */
 export function readSearchWarnings(extensions: Record<string, unknown> | undefined): string[] {
   const search = extensions?.search
@@ -666,6 +678,9 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
       },
       estimatedCost: input.pageSize * INLINE_MEMBER_PAGE_SIZE,
       signal: input.signal,
+      // Makes Shopify report whether it honoured the updated_at filter (R-13). Without it,
+      // `searchWarnings` below is always empty and the check passes vacuously.
+      headers: SEARCH_DEBUG_HEADER,
     })
 
     const edges = data?.collections?.edges ?? []
