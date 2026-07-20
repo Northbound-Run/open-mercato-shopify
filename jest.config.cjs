@@ -19,6 +19,19 @@ module.exports = {
         tsconfig: {
           module: 'commonjs',
           moduleResolution: 'node',
+          // `moduleResolution: 'node'` predates package `exports` maps, so a specifier like
+          // `@open-mercato/shared/modules/integrations/types` — which typecheck resolves fine under
+          // `Bundler` — fails here with TS2307. There is no specifier that satisfies both, which
+          // meant a tested module could not reference framework types *even as `import type`*, and
+          // the workaround was hand-mirroring those types with all the drift risk that carries.
+          // Mapping the subpaths to their real on-disk location fixes it for ts-jest only; the
+          // build and `yarn typecheck` continue to use the exports map.
+          baseUrl: '.',
+          paths: {
+            '@open-mercato/core/*': ['node_modules/@open-mercato/core/src/*'],
+            '@open-mercato/shared/*': ['node_modules/@open-mercato/shared/src/*'],
+            '@open-mercato/ui/*': ['node_modules/@open-mercato/ui/src/*'],
+          },
           jsx: 'react-jsx',
           esModuleInterop: true,
           allowSyntheticDefaultImports: true,
