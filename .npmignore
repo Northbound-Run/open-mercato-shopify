@@ -1,0 +1,5 @@
+# OMC / agent tooling session state — never ship it, wherever an agent's cwd dropped it.
+# (The `files` whitelist in package.json includes all of src/, so a stray .omc under
+#  src/ would otherwise leak into the tarball.)
+**/.omc/
+.omc/
