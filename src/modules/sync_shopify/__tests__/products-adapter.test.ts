@@ -68,18 +68,26 @@ type ClientScript = {
   jsonl?: string
   deltaPages?: { nodes: unknown[]; hasNextPage?: boolean; endCursor?: string }[]
   currencyCode?: string | null
+  extensions?: Record<string, unknown>
 }
 
 function makeClient(script: ClientScript) {
-  const requests: { query: string; variables: Record<string, unknown> }[] = []
+  const requests: {
+    query: string
+    variables: Record<string, unknown>
+    headers?: Record<string, string>
+  }[] = []
   let deltaPage = 0
 
   const client = {
     shopDomain: 'test.myshopify.com',
     apiVersion: '2026-07',
     cost: {} as ShopifyClient['cost'],
-    async request<TData>(query: string, options?: { variables?: Record<string, unknown> }): Promise<TData> {
-      requests.push({ query, variables: options?.variables ?? {} })
+    async request<TData>(
+      query: string,
+      options?: { variables?: Record<string, unknown>; headers?: Record<string, string> },
+    ): Promise<TData> {
+      requests.push({ query, variables: options?.variables ?? {}, headers: options?.headers })
 
       if (query.includes('SyncShopifyShopCurrency')) {
         return { shop: { currencyCode: script.currencyCode === undefined ? 'GBP' : script.currencyCode } } as TData
@@ -114,6 +122,17 @@ function makeClient(script: ClientScript) {
       }
       throw new Error(`unexpected query: ${query.slice(0, 60)}`)
     },
+    async requestDetailed<TData>(
+      query: string,
+      options?: { variables?: Record<string, unknown>; headers?: Record<string, string> },
+    ) {
+      return {
+        data: (await client.request(query, options)) as TData,
+        // Real Shopify only fills `search[].warnings` when the request carried the debug header;
+        // the header assertion below is what stops us relying on a check that would never fire.
+        extensions: script.extensions,
+      }
+    },
   } as unknown as ShopifyClient
 
   return { client, requests }
@@ -128,7 +147,11 @@ function makeHarness(script: ClientScript = {}, previous?: { store: Store }) {
     ['regular', { id: 'kind-regular' }],
     ['sale', { id: 'kind-sale' }],
   ])
-  const calls = { listOwnedLocalIds: 0, findVariantsByProductId: [] as string[] }
+  const calls = {
+    listOwnedLocalIds: 0,
+    findVariantsByProductId: [] as string[],
+    execute: [] as { commandId: string; input: Record<string, unknown> }[],
+  }
 
   const runtime: ProductsRuntime = {
     writer,
@@ -147,6 +170,16 @@ function makeHarness(script: ClientScript = {}, previous?: { store: Store }) {
         }
         return null
       },
+      async deleteExternalIdMapping(_integrationId, entityType, localId) {
+        const prefix = `${entityType}::`
+        for (const [key, value] of store.mappings) {
+          if (value === localId && key.startsWith(prefix)) {
+            store.mappings.delete(key)
+            return true
+          }
+        }
+        return false
+      },
     },
     readProduct: async (id) => store.rows.get(id) ?? null,
     readVariant: async (id) => store.rows.get(id) ?? null,
@@ -162,6 +195,12 @@ function makeHarness(script: ClientScript = {}, previous?: { store: Store }) {
       calls.listOwnedLocalIds += 1
       const prefix = `${entityType}::`
       return [...store.mappings.entries()].filter(([k]) => k.startsWith(prefix)).map(([, v]) => v)
+    },
+    execute: async (commandId, input) => {
+      calls.execute.push({ commandId, input })
+      // The real bus removes the row; modelling that is what makes the sale-ended assertions
+      // about the surviving price set meaningful rather than circular.
+      if (commandId === 'catalog.prices.delete') store.rows.delete(input.id as string)
     },
   }
 
@@ -600,6 +639,177 @@ describe('full-sync product reconciliation', () => {
 
     const third = makeHarness({ jsonl: jsonl(PRODUCT_2, []) }, second)
     expect(actionsFor(await collect(third), PRODUCT_1.id)).toEqual(['skip'])
+  })
+})
+
+// ── 🔴 Sale lifecycle ────────────────────────────────────────────────────────────────────────
+
+/** Every surviving price row for a variant, as `{ kindId: amount }`. */
+function pricesFor(h: Harness, variantExternalId: string): Record<string, unknown> {
+  const variantLocalId = localIdOf(h, 'catalog_product_variant', variantExternalId)
+  return Object.fromEntries(
+    [...h.store.rows.values()]
+      .filter((row) => row.priceKindId && row.variantId === variantLocalId)
+      .map((row) => [row.priceKindId as string, row.unitPriceGross]),
+  )
+}
+
+const ON_SALE = { ...VARIANT_A, price: '19.00', compareAtPrice: '29.00' }
+const OFF_SALE = { ...VARIANT_A, price: '29.00', compareAtPrice: null }
+
+describe('sale lifecycle — on sale, then off sale', () => {
+  it('🔴 removes the sale row when the sale ends, leaving only the regular price', async () => {
+    // The bug this closes: `selectBestPrice` scores a promotional kind ABOVE a regular one, so a
+    // sale row left behind keeps winning and the customer keeps paying the sale price forever.
+    // Nothing surfaces it — the run reports success and the regular price is updated correctly.
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) })
+    await collect(first)
+
+    expect(pricesFor(first, VARIANT_A.id)).toEqual({ 'kind-regular': '29.00', 'kind-sale': '19.00' })
+
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) }, first)
+    const batches = await collect(second)
+
+    // Exactly one row survives, it is the regular kind, and it holds the post-sale price. That is
+    // the precondition `selectBestPrice` resolves against — with no promotional row in the set it
+    // has nothing to prefer, so the charged price is 29.00.
+    expect(pricesFor(second, VARIANT_A.id)).toEqual({ 'kind-regular': '29.00' })
+
+    expect(second.calls.execute).toEqual([
+      {
+        commandId: 'catalog.prices.delete',
+        input: { id: expect.any(String), organizationId: 'org-1', tenantId: 'tenant-1' },
+      },
+    ])
+    expect(items(batches).find((i) => i.externalId.endsWith(':price:sale::GBP'))).toMatchObject({
+      action: 'update',
+      data: { reason: 'price_kind_no_longer_offered' },
+    })
+  })
+
+  it('drops the mapping too, so the next run cannot resurrect the row', async () => {
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) })
+    await collect(first)
+
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) }, first)
+    await collect(second)
+
+    // A surviving mapping would route the next run into the update branch against a deleted row.
+    expect([...second.store.mappings.keys()]).not.toContain(
+      `catalog_product_price::${VARIANT_A.id}:price:sale::GBP`,
+    )
+
+    const third = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) }, second)
+    await collect(third)
+    expect(pricesFor(third, VARIANT_A.id)).toEqual({ 'kind-regular': '29.00' })
+    // Nothing left to delete — the cleanup does not repeat on every subsequent run.
+    expect(third.calls.execute).toEqual([])
+  })
+
+  it('restores the sale row when the product goes on sale again', async () => {
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) })
+    await collect(first)
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) }, first)
+    await collect(second)
+
+    const third = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) }, second)
+    await collect(third)
+
+    expect(pricesFor(third, VARIANT_A.id)).toEqual({ 'kind-regular': '29.00', 'kind-sale': '19.00' })
+  })
+
+  it('deletes nothing while a sale is still running', async () => {
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) })
+    await collect(first)
+
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) }, first)
+    await collect(second)
+
+    expect(second.calls.execute).toEqual([])
+    expect(pricesFor(second, VARIANT_A.id)).toEqual({ 'kind-regular': '29.00', 'kind-sale': '19.00' })
+  })
+
+  it('never deletes a price row this integration does not own', async () => {
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) })
+    await collect(first)
+
+    // A promotional price an operator set by hand: no external-id mapping, so invisible to us.
+    const variantLocalId = localIdOf(first, 'catalog_product_variant', VARIANT_A.id)
+    first.store.rows.set('hand-priced', {
+      id: 'hand-priced',
+      variantId: variantLocalId,
+      priceKindId: 'kind-manual',
+      unitPriceGross: '12.00',
+    })
+
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) }, first)
+    await collect(second)
+
+    expect(second.store.rows.get('hand-priced')).toMatchObject({ unitPriceGross: '12.00' })
+    expect(second.calls.execute.map((c) => c.input.id)).not.toContain('hand-priced')
+  })
+
+  it('🔴 deletes nothing when the price could not be read at all', async () => {
+    // An unparseable price is indistinguishable from "no price" here. Treating that as "remove
+    // everything" would turn a mapping bug of ours into silent data loss.
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) })
+    await collect(first)
+
+    const broken = { ...VARIANT_A, price: 'not-a-number', compareAtPrice: null }
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [broken]) }, first)
+    await collect(second)
+
+    expect(second.calls.execute).toEqual([])
+    expect(pricesFor(second, VARIANT_A.id)).toEqual({ 'kind-regular': '29.00', 'kind-sale': '19.00' })
+  })
+
+  it('reports a failed delete without aborting the run', async () => {
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [ON_SALE]) })
+    await collect(first)
+
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) }, first)
+    second.runtime.execute = async () => {
+      throw new Error('price delete rejected')
+    }
+    const batches = await collect(second)
+
+    expect(items(batches).find((i) => i.externalId.endsWith(':price:sale::GBP'))).toMatchObject({
+      action: 'failed',
+      data: { errorMessage: 'price delete rejected' },
+    })
+    // The rest of the run still landed. The regular row reports `skip` rather than `update`
+    // because its amount genuinely did not move — 29.00 was the list price during the sale and is
+    // the plain price after it. Only the sale row needed removing, which is the whole point.
+    expect(actionsFor(batches, `${VARIANT_A.id}:price:regular::GBP`)).toEqual(['skip'])
+  })
+})
+
+// ── R-13 second belt ─────────────────────────────────────────────────────────────────────────
+
+describe('search warnings', () => {
+  it('fails when Shopify reports that it did not understand the search query', async () => {
+    const h = makeHarness({
+      deltaPages: [{ nodes: [delta(PRODUCT_1, [VARIANT_A])] }],
+      extensions: { search: [{ warnings: [{ message: 'Unknown field updatd_at' }] }] },
+    })
+
+    await expect(collect(h, { cursor: IDLE_CURSOR })).rejects.toThrow(/search warnings/)
+  })
+
+  it('asks Shopify to report them — without the header the check is silently dead', async () => {
+    const h = makeHarness({ deltaPages: [{ nodes: [delta(PRODUCT_1, [VARIANT_A])] }] })
+    await collect(h, { cursor: IDLE_CURSOR })
+
+    const request = h.requests.find((r) => r.query.includes('SyncShopifyProductsDelta'))!
+    expect(request.headers).toMatchObject({ 'Shopify-Search-Query-Debug': '1' })
+  })
+
+  it('passes cleanly when Shopify reports no warnings', async () => {
+    const h = makeHarness({
+      deltaPages: [{ nodes: [delta(PRODUCT_1, [VARIANT_A])] }],
+      extensions: { search: [{ warnings: [] }] },
+    })
+    await expect(collect(h, { cursor: IDLE_CURSOR })).resolves.toBeDefined()
   })
 })
 

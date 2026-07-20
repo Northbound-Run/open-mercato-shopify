@@ -5,7 +5,7 @@ import type {
   StreamImportInput,
   TenantScope,
 } from '@open-mercato/core/modules/data_sync/lib/adapter'
-import type { ShopifyClient } from '../client'
+import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../client'
 import { childrenOfType, runBulkExport, type BulkExportOptions, type BulkNode } from '../bulk'
 import {
   advanceCursor,
@@ -36,9 +36,11 @@ import {
   mapPrice,
   mapProduct,
   mapVariant,
+  priceExternalId,
   readContentHash,
   resolveCurrencyCode,
   toPriceIntents,
+  type PriceIntent,
   type PriceKindCode,
   type ShopifyProductNode,
   type ShopifyVariantNode,
@@ -103,6 +105,18 @@ export type ProductsMappingPort = ExternalIdMappingPort & {
     localId: string,
     scope: TenantScope,
   ): Promise<string | null>
+  /**
+   * Forget a mapping whose row we just deleted.
+   *
+   * Without this the mapping outlives the row, and the next run resolves through it, re-reads
+   * nothing, and creates a replacement — resurrecting the price we deliberately removed.
+   */
+  deleteExternalIdMapping(
+    integrationId: string,
+    entityType: string,
+    localId: string,
+    scope: TenantScope,
+  ): Promise<boolean>
 }
 
 export type ProductsRuntime = {
@@ -125,6 +139,14 @@ export type ProductsRuntime = {
   findVariantsByProductId(productLocalId: string): Promise<EntityRow[]>
   /** Local ids this integration has mapped for an entity type. Ownership-gated by construction. */
   listOwnedLocalIds(entityType: string): Promise<string[]>
+  /**
+   * Dispatch a command the writer's `upsert` shape cannot express — currently only deletes.
+   *
+   * `di.ts` wires this to `commandBus.execute(commandId, { input, ctx: writer.commandContext })`,
+   * so a delete carries the same organization scope and fires the same side effects as every other
+   * write in the run. The command id still comes from `lib/constants.ts` on this side.
+   */
+  execute(commandId: string, input: Record<string, unknown>): Promise<void>
 }
 
 export type ProductsAdapterDeps = {
@@ -342,6 +364,88 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
 
   // ── Writes ─────────────────────────────────────────────────────────────────────────────────
 
+  /**
+   * Remove price rows that should no longer exist — in practice, the `sale` row after a sale ends.
+   *
+   * 🔴 This is a commercial bug, not housekeeping. `selectBestPrice` scores a promotional kind
+   * above a regular one, so a `sale` row left behind keeps winning and the customer keeps paying
+   * the sale price indefinitely. Nothing surfaces it: the run reports success and the regular
+   * price is updated correctly, it simply never gets used.
+   *
+   * No query is needed. The price kinds are a closed set and the external id is deterministic, so
+   * every row this adapter could have written for a variant is enumerable — and a mapping hit is
+   * itself the §4.8 ownership proof, because the mapping table is partitioned by integration. A
+   * price row a human added by hand has no mapping and is therefore invisible here.
+   *
+   * Prices are DELETED rather than deactivated, per §4.8: only products, variants and categories
+   * are deactivated.
+   */
+  async function reconcilePrices(
+    variant: ShopifyVariantNode,
+    desired: PriceIntent[],
+    currencyCode: string,
+    ctx: RunContext,
+  ): Promise<ImportItem[]> {
+    // Nothing derived means Shopify reported no usable price — which is also what a value we
+    // failed to parse looks like. Deleting on that evidence would turn a mapping bug of ours into
+    // silent data loss, so an empty desired set means "no opinion", not "remove everything".
+    if (desired.length === 0) return []
+
+    const keep = new Set(desired.map((intent) => intent.externalId))
+    const items: ImportItem[] = []
+
+    for (const kindCode of Object.values(PRICE_KIND_CODE)) {
+      const externalId = priceExternalId(variant.id, kindCode, currencyCode)
+      if (keep.has(externalId)) continue
+
+      try {
+        const localId = await ctx.runtime.mapping.lookupLocalId(
+          integrationId,
+          MAPPING_ENTITY_TYPE.productPrice,
+          externalId,
+          ctx.scope,
+        )
+        // Never written, or already cleaned up by an earlier run.
+        if (!localId) continue
+
+        // The mapping can outlive the row. Deleting one that is already gone would fail the item
+        // for no reason, but dropping the stale mapping is still worth doing.
+        const row = await ctx.runtime.readPrice(localId)
+        if (row) {
+          await ctx.runtime.execute(COMMAND.priceDelete, {
+            id: localId,
+            organizationId: ctx.scope.organizationId,
+            tenantId: ctx.scope.tenantId,
+          })
+        }
+        await ctx.runtime.mapping.deleteExternalIdMapping(
+          integrationId,
+          MAPPING_ENTITY_TYPE.productPrice,
+          localId,
+          ctx.scope,
+        )
+
+        items.push({
+          externalId,
+          action: row ? 'update' : 'skip',
+          data: { localId, kind: kindCode, reason: 'price_kind_no_longer_offered' },
+        })
+      } catch (error) {
+        // Per-item, like every other write: a failed cleanup must not abort the run.
+        items.push({
+          externalId,
+          action: 'failed',
+          data: {
+            sourceIdentifier: externalId,
+            errorMessage: error instanceof Error ? error.message : String(error),
+          },
+        })
+      }
+    }
+
+    return items
+  }
+
   async function importPrices(
     variant: ShopifyVariantNode,
     variantLocalId: string,
@@ -349,9 +453,10 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
     ctx: RunContext,
   ): Promise<ImportItem[]> {
     const currencyCode = resolveCurrencyCode(node, ctx.currencyCode)
+    const intents = toPriceIntents(variant, currencyCode)
     const items: ImportItem[] = []
 
-    for (const intent of toPriceIntents(variant, currencyCode)) {
+    for (const intent of intents) {
       const input = mapPrice(intent, variantLocalId, ctx.priceKinds[intent.kindCode], ctx.scope)
       const outcome = await ctx.runtime.writer.upsert({
         externalId: intent.externalId,
@@ -369,6 +474,7 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
       items.push(toImportItem(outcome, { kind: intent.kindCode, amount: intent.amount }))
     }
 
+    items.push(...(await reconcilePrices(variant, intents, currencyCode, ctx)))
     return items
   }
 
@@ -595,6 +701,35 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
    * reports success, and the only visible symptom is records older than the window we asked for.
    * The client consumes `extensions` internally, so the returned data is the evidence available.
    */
+  /**
+   * Shopify's own account of whether it understood the search query.
+   *
+   * The first of two independent R-13 defences, and the more direct one: it catches the fault on
+   * the request itself rather than inferring it from the rows that came back. It only works
+   * because the request sends `SEARCH_DEBUG_HEADER` — Shopify populates `extensions.search`
+   * solely when asked, so dropping that header makes this silently pass forever.
+   *
+   * `assertDeltaWindowRespected` below is kept as the second belt precisely because this one has
+   * that dependency: it needs no header, no cooperation from Shopify, and would still catch a
+   * filter that was honoured in form but not in effect.
+   */
+  function assertSearchWarningsEmpty(extensions: Record<string, unknown> | undefined): void {
+    const search = extensions?.search
+    if (!Array.isArray(search)) return
+
+    const warnings = search.flatMap((entry) => {
+      const list = (entry as { warnings?: unknown } | null)?.warnings
+      return Array.isArray(list) ? list : []
+    })
+    if (warnings.length === 0) return
+
+    throw new ProductsSyncError(
+      'search_filter_ignored',
+      `[internal] Shopify reported search warnings for the delta query: ${JSON.stringify(warnings)}; ` +
+        'an unrecognised field is ignored rather than rejected, so this run would rescan everything',
+    )
+  }
+
   function assertDeltaWindowRespected(nodes: ShopifyProductNode[], updatedAfter: string): void {
     const floor = Date.parse(updatedAfter)
     for (const node of nodes) {
@@ -617,7 +752,7 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
     let after = options.after
 
     for (;;) {
-      const data = await client.request<DeltaResponse>(PRODUCTS_DELTA_QUERY, {
+      const { data, extensions } = await client.requestDetailed<DeltaResponse>(PRODUCTS_DELTA_QUERY, {
         variables: {
           first: DELTA_PRODUCT_PAGE_SIZE,
           after,
@@ -625,10 +760,14 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
           variantFirst: DELTA_VARIANT_PAGE_SIZE,
         },
         estimatedCost: DELTA_PRODUCT_PAGE_SIZE * (1 + DELTA_VARIANT_PAGE_SIZE),
+        // Without this header Shopify never populates `extensions.search`, and the warning check
+        // below is wired but permanently silent.
+        headers: SEARCH_DEBUG_HEADER,
       })
 
       const connection = data?.products
       const nodes = edgeNodes(connection).map(fromDeltaNode)
+      assertSearchWarningsEmpty(extensions)
       assertDeltaWindowRespected(nodes, options.updatedAfter)
 
       const endCursor = connection?.pageInfo?.endCursor ?? null
