@@ -223,6 +223,14 @@ describe('mapProduct — §5.1 field mapping', () => {
     expect(mapped.input.title).toBe('Merino Beanie')
     expect(mapped.contentHash).toEqual(expect.any(String))
   })
+
+  it('🔴 never emits categoryIds — that field REPLACES the whole category set', () => {
+    // `catalog.products.update { categoryIds }` overwrites a product's entire membership, which the
+    // collections sync (WS-C) owns. The payload builder must never carry it, or a products run
+    // would wipe every collection membership the collections run established.
+    expect(mapProduct(product(), SCOPE).input).not.toHaveProperty('categoryIds')
+    expect(mapProduct(product({ tags: ['a', 'b'] }), SCOPE).input).not.toHaveProperty('categoryIds')
+  })
 })
 
 describe('mapProduct — content hash', () => {
