@@ -82,9 +82,16 @@ export async function requestAccessToken(input: RequestTokenInput): Promise<Acce
   }
 
   if (!response.ok) {
-    // 401/403 means the credentials themselves are wrong, which is not retryable and should
-    // surface to the operator as "fix your client ID/secret" rather than as an outage.
-    const code = response.status === 401 || response.status === 403 ? 'invalid_client' : 'token_request_failed'
+    // Status carries real diagnostic value here, and each case needs a different fix:
+    //   401/403 → credentials are wrong, or the app is not installed on this store
+    //   404     → the store itself does not exist at that domain
+    //   5xx     → Shopify-side, worth retrying
+    const code =
+      response.status === 401 || response.status === 403
+        ? 'invalid_client'
+        : response.status === 404
+          ? 'shop_not_found'
+          : 'token_request_failed'
     // Never echo the body — it can contain the submitted client_secret.
     throw new ShopifyAuthError(code, `[internal] token request returned HTTP ${response.status}`)
   }
