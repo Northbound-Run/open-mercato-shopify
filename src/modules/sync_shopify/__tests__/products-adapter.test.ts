@@ -21,7 +21,14 @@ type Harness = ReturnType<typeof makeHarness>
 
 const storeKey = (entityType: string, externalId: string) => `${entityType}::${externalId}`
 
-function makeWriter(store: Store) {
+/** Every payload the writer actually dispatched, so a test can gate on what reaches the bus. */
+type WriteRecord = {
+  mappingEntityType: string
+  command: 'create' | 'update'
+  input: Record<string, unknown>
+}
+
+function makeWriter(store: Store, writes: WriteRecord[]) {
   const { rows, mappings } = store
   let sequence = rows.size
 
@@ -40,11 +47,13 @@ function makeWriter(store: Store) {
           if (update === null) {
             return { ok: true, action: 'skip', externalId: spec.externalId, localId: mapped, resolvedVia: 'mapping' }
           }
+          writes.push({ mappingEntityType: spec.mappingEntityType, command: 'update', input: { ...update, id: mapped } })
           rows.set(mapped, { ...existing, ...update, id: mapped })
           return { ok: true, action: 'update', externalId: spec.externalId, localId: mapped, resolvedVia: 'mapping' }
         }
 
         const input = await spec.buildCreateInput()
+        writes.push({ mappingEntityType: spec.mappingEntityType, command: 'create', input })
         const localId = `local-${++sequence}`
         rows.set(localId, { ...input, id: localId })
         mappings.set(storeKey(spec.mappingEntityType, spec.externalId), localId)
@@ -141,7 +150,8 @@ function makeClient(script: ClientScript) {
 /** `previous` continues an earlier run against the same store. Omit it for a fresh install. */
 function makeHarness(script: ClientScript = {}, previous?: { store: Store }) {
   const store: Store = previous?.store ?? { rows: new Map(), mappings: new Map() }
-  const writer = makeWriter(store)
+  const writes: WriteRecord[] = []
+  const writer = makeWriter(store, writes)
   const { client, requests } = makeClient(script)
   const priceKinds = new Map<string, EntityRow>([
     ['regular', { id: 'kind-regular' }],
@@ -213,7 +223,7 @@ function makeHarness(script: ClientScript = {}, previous?: { store: Store }) {
     },
   })
 
-  return { adapter, store, writer, requests, runtime, priceKinds, calls }
+  return { adapter, store, writer, writes, requests, runtime, priceKinds, calls }
 }
 
 async function collect(h: Harness, over: Partial<StreamImportInput> = {}): Promise<ImportBatch[]> {
@@ -318,6 +328,56 @@ describe('shopify products adapter — contract', () => {
     expect(external).toContain('descriptionHtml')
     expect(external).not.toContain('bodyHtml')
     expect(external).not.toContain('images')
+  })
+})
+
+// ── 🔴 Category assignments — the WS-C hazard ────────────────────────────────────────────────
+
+describe('never writes categoryIds through catalog.products.update', () => {
+  // There is no category-assignment command: membership is writable only via
+  // `catalog.products.update { id, categoryIds }`, and core's `syncCategoryAssignments` REPLACES a
+  // product's WHOLE category set — anything absent from the array is deleted. The collections sync
+  // (WS-C) owns that field. If this adapter ever sent it, a products run would silently wipe every
+  // membership the collections run established, and because the two run on independent schedules it
+  // would present as memberships randomly vanishing. This guard turns that footgun into a red test.
+  const productWrites = (h: Harness) =>
+    h.writes.filter((w) => w.mappingEntityType === 'catalog_product')
+
+  it('omits categoryIds on the create path', async () => {
+    const h = makeHarness({ jsonl: jsonl(PRODUCT_1, [VARIANT_A]) })
+    await collect(h)
+
+    expect(productWrites(h)).not.toHaveLength(0)
+    for (const write of productWrites(h)) {
+      expect(write.input).not.toHaveProperty('categoryIds')
+      expect(write.input).not.toHaveProperty('categoryId')
+    }
+  })
+
+  it('omits categoryIds on the update path', async () => {
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [VARIANT_A]) })
+    await collect(first)
+
+    const renamed = { ...PRODUCT_1, title: 'Renamed' }
+    const second = makeHarness({ jsonl: jsonl(renamed, [VARIANT_A]) }, first)
+    await collect(second)
+
+    const updates = productWrites(second).filter((w) => w.command === 'update')
+    expect(updates).not.toHaveLength(0)
+    for (const write of updates) expect(write.input).not.toHaveProperty('categoryIds')
+  })
+
+  it('omits categoryIds on the full-sync reconciliation path', async () => {
+    const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [VARIANT_A]) })
+    await collect(first)
+
+    // Product 1 vanishes upstream; the deactivation write must not carry categoryIds either.
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_2, []) }, first)
+    await collect(second)
+
+    for (const write of productWrites(second)) {
+      expect(write.input).not.toHaveProperty('categoryIds')
+    }
   })
 })
 
