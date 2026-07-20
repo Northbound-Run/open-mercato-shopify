@@ -50,22 +50,35 @@ const MAX_SLUG_LENGTH = 150
  * What we learned about how Shopify decides this collection's membership.
  *
  * Diagnostic only — none of it is written to the category. It rides along on the reported
- * `ImportItem` so an operator can see, in the run log, that a collection is rule-driven upstream
- * and that what landed locally is a snapshot rather than a live rule.
+ * `ImportItem` so an operator can see, in the run log, that what landed locally is a snapshot and
+ * that Shopify holds definition metadata we did not keep.
  */
 export type CollectionRuleInfo = {
-  /** Shopify computes this collection's membership. What we store is a point-in-time snapshot. */
-  isRuleDriven: boolean
+  /**
+   * Shopify holds membership-defining metadata for this collection — 2026-07 `sources`, or a
+   * legacy `ruleSet` carrying rules — that we do not and cannot preserve.
+   *
+   * Deliberately NOT called `isRuleDriven`. `sources` is a list of an interface
+   * (`[CollectionSource!]!`) whose implementations include both condition-bearing kinds
+   * (`CollectionSourceInclusion`, `CollectionSourceExclusion`) and, on the evidence available,
+   * possibly a curated-list kind too. Telling those apart means hard-coding concrete type names,
+   * and the names are exactly what a quarterly release renames. So this flag answers the question
+   * we can actually answer — "is there upstream definition metadata we dropped?" — and errs toward
+   * saying yes. Over-warning costs a line in a run log; under-warning lets an operator believe
+   * smart-collection rules survived the import.
+   */
+  hasUnpreservedSources: boolean
   /**
    * Which field told us. `sources` is the 2026-07 model and the one we query; `ruleSet` means the
-   * payload predates it. `none` means neither was present — a manual collection, or a query that
-   * did not ask.
+   * payload predates it. `none` means neither was present — a hand-built collection, or a query
+   * that did not ask.
    */
   readFrom: 'sources' | 'ruleSet' | 'none'
   /**
    * `__typename`s observed on `sources`, deduplicated. Kept because this is the surface most
    * likely to change at the next quarterly release: an unfamiliar name appearing in a run log is
-   * the earliest warning available that the shape moved under us.
+   * the earliest warning available that the shape moved under us — and it is the raw evidence for
+   * anyone who later needs the distinction this type declines to draw.
    */
   sourceTypes: string[]
 }
@@ -156,7 +169,7 @@ function truncate(value: string, max: number): string {
 // ── Rules ────────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Decide whether Shopify is computing this collection's membership, from either model.
+ * Decide whether Shopify holds membership metadata this import drops, from either model.
  *
  * `sources` is checked first and wins: on 2026-07 both may be present, and the deprecated field is
  * the one that will disappear. Note how little is extracted — a `__typename` and a yes/no. The
@@ -169,22 +182,21 @@ export function readRuleInfo(raw: Record<string, unknown>): CollectionRuleInfo {
     const sourceTypes = Array.from(
       new Set(sources.map((source) => asString(source.__typename)).filter((t): t is string => t !== null)),
     )
-    // Any source at all means Shopify is assembling this collection rather than an operator
-    // hand-picking it. We do not try to classify which sources are rule-bearing: the union's member
-    // names are the part most likely to churn, and being wrong about them would mislabel a
-    // collection in a run log that exists precisely to warn about churn.
-    return { isRuleDriven: true, readFrom: 'sources', sourceTypes }
+    // Any source at all counts. See `hasUnpreservedSources` for why this does not try to sort
+    // condition-bearing sources from curated ones.
+    return { hasUnpreservedSources: true, readFrom: 'sources', sourceTypes }
   }
 
   // Pre-2026-07 payload, or a fixture captured from one. Read it so such a collection still reports
-  // honestly, but never query for it: `ruleSet` is deprecated and its absence is expected.
+  // honestly, but never query for it: `ruleSet` is deprecated and its absence is expected. Here the
+  // distinction IS available — a `ruleSet` with no rules is genuinely a manual collection.
   const ruleSet = asRecord(raw.ruleSet)
   if (ruleSet) {
     const rules = toNodeList(ruleSet.rules)
-    return { isRuleDriven: rules.length > 0, readFrom: 'ruleSet', sourceTypes: [] }
+    return { hasUnpreservedSources: rules.length > 0, readFrom: 'ruleSet', sourceTypes: [] }
   }
 
-  return { isRuleDriven: false, readFrom: 'none', sourceTypes: [] }
+  return { hasUnpreservedSources: false, readFrom: 'none', sourceTypes: [] }
 }
 
 // ── Collection ───────────────────────────────────────────────────────────────────────────────

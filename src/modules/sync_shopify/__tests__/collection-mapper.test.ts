@@ -115,32 +115,32 @@ describe('mapCollection', () => {
       slug: null,
       description: '',
       updatedAt: null,
-      rules: { isRuleDriven: false, readFrom: 'none', sourceTypes: [] },
+      rules: { hasUnpreservedSources: false, readFrom: 'none', sourceTypes: [] },
     })
   })
 })
 
 describe('readRuleInfo — the 2026-07 sources model', () => {
-  it('reads `sources` and reports the collection as rule-driven', () => {
+  it('reads `sources` and flags the definition as unpreserved', () => {
     const info = readRuleInfo({
       ...BASE,
-      sources: [{ __typename: 'CollectionRuleSource' }, { __typename: 'CollectionRuleSource' }],
+      sources: [{ __typename: 'CollectionSourceInclusion' }, { __typename: 'CollectionSourceInclusion' }],
     })
     expect(info).toEqual({
-      isRuleDriven: true,
+      hasUnpreservedSources: true,
       readFrom: 'sources',
       // Deduplicated: the point is to notice an unfamiliar type name after an API bump, not to
       // count occurrences.
-      sourceTypes: ['CollectionRuleSource'],
+      sourceTypes: ['CollectionSourceInclusion'],
     })
   })
 
   it('reads `sources` in connection form too, in case a release changes its shape', () => {
     const info = readRuleInfo({
       ...BASE,
-      sources: { edges: [{ node: { __typename: 'CollectionRuleSource' } }] },
+      sources: { edges: [{ node: { __typename: 'CollectionSourceInclusion' } }] },
     })
-    expect(info.isRuleDriven).toBe(true)
+    expect(info.hasUnpreservedSources).toBe(true)
     expect(info.readFrom).toBe('sources')
   })
 
@@ -148,7 +148,7 @@ describe('readRuleInfo — the 2026-07 sources model', () => {
     // On 2026-07 both can appear. `ruleSet` is the deprecated one and is the one that will vanish.
     const info = readRuleInfo({
       ...BASE,
-      sources: [{ __typename: 'CollectionRuleSource' }],
+      sources: [{ __typename: 'CollectionSourceInclusion' }],
       ruleSet: { appliedDisjunctively: false, rules: [{ column: 'TAG', relation: 'EQUALS', condition: 'sale' }] },
     })
     expect(info.readFrom).toBe('sources')
@@ -164,29 +164,29 @@ describe('readRuleInfo — the 2026-07 sources model', () => {
         rules: [{ column: 'TAG', relation: 'EQUALS', condition: 'summer' }],
       },
     })
-    expect(info).toEqual({ isRuleDriven: true, readFrom: 'ruleSet', sourceTypes: [] })
+    expect(info).toEqual({ hasUnpreservedSources: true, readFrom: 'ruleSet', sourceTypes: [] })
   })
 
   it('treats an empty ruleSet as a manual collection', () => {
     expect(readRuleInfo({ ...BASE, ruleSet: { rules: [] } })).toEqual({
-      isRuleDriven: false,
+      hasUnpreservedSources: false,
       readFrom: 'ruleSet',
       sourceTypes: [],
     })
   })
 
   it('reports a manual collection when neither field is present', () => {
-    expect(readRuleInfo(BASE)).toEqual({ isRuleDriven: false, readFrom: 'none', sourceTypes: [] })
+    expect(readRuleInfo(BASE)).toEqual({ hasUnpreservedSources: false, readFrom: 'none', sourceTypes: [] })
     expect(readRuleInfo({ ...BASE, sources: [] })).toEqual({
-      isRuleDriven: false,
+      hasUnpreservedSources: false,
       readFrom: 'none',
       sourceTypes: [],
     })
   })
 
-  it('surfaces rule information through mapCollection, where the adapter reads it', () => {
-    const mapped = mapCollection({ ...BASE, sources: [{ __typename: 'CollectionRuleSource' }] })
-    expect(mapped!.rules.isRuleDriven).toBe(true)
+  it('surfaces source information through mapCollection, where the adapter reads it', () => {
+    const mapped = mapCollection({ ...BASE, sources: [{ __typename: 'CollectionSourceInclusion' }] })
+    expect(mapped!.rules.hasUnpreservedSources).toBe(true)
   })
 })
 

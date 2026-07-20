@@ -3,6 +3,7 @@ import {
   buildCollectionsDeltaQuery,
   buildUpdatedAtFilter,
   createShopifyCollectionsAdapter,
+  readSearchWarnings,
   type CollectionsAdapterDeps,
   type CollectionsRunContext,
 } from '../lib/adapters/collections'
@@ -166,6 +167,11 @@ function makeClient(responder: Responder): ShopifyClient {
     async request<TData>(query: string, options?: { variables?: Record<string, unknown> }) {
       return responder(query, options?.variables ?? {}) as TData
     },
+    async requestDetailed<TData>(query: string, options?: { variables?: Record<string, unknown> }) {
+      // No `extensions` by default — that is the ordinary case, and it keeps every other test off
+      // the R-13 path. The search-warning test overrides this method to supply an envelope.
+      return { data: responder(query, options?.variables ?? {}) as TData, extensions: undefined }
+    },
   }
 }
 
@@ -292,6 +298,41 @@ describe('query construction', () => {
     // that still looks correct. This assertion is the only cheap defence available.
     expect(buildUpdatedAtFilter('2026-07-19T10:00:00.000Z')).toBe("updated_at:>'2026-07-19T10:00:00.000Z'")
     expect(buildUpdatedAtFilter(null)).toBeNull()
+  })
+
+  it('reports a delta filter Shopify silently ignored', async () => {
+    // R-13: an invalid search field is not an error — "the query is ignored and all results are
+    // returned". The only evidence is `extensions.search[].warnings`, so a delta run that scans the
+    // whole catalog otherwise looks like a fast, correct one.
+    const world = makeWorld()
+    const client = makeClient(() => ({
+      collections: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    }))
+    client.requestDetailed = (async () => ({
+      data: { collections: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } } },
+      extensions: { search: [{ warnings: [{ field: 'updated_at', message: 'Field is not supported' }] }] },
+    })) as never
+
+    const adapter = createShopifyCollectionsAdapter({
+      createClient: () => client,
+      createRunContext: async () => world.runContext,
+    })
+
+    const cursor = JSON.stringify({ v: 1, kind: 'idle', updatedAfter: '2026-07-01T00:00:00.000Z' })
+    const items = (await drain(adapter.streamImport!(streamInput({ cursor })))).flatMap((batch) => batch.items)
+
+    expect(items).toHaveLength(1)
+    expect(items[0].action).toBe('failed')
+    expect(items[0].data.errorMessage).toContain('ignored the delta filter')
+    expect(items[0].data.sourceIdentifier).toBe("updated_at:>'2026-07-01T00:00:00.000Z'")
+  })
+
+  it('reads search warnings out of whatever shape the extensions envelope has', () => {
+    expect(readSearchWarnings(undefined)).toEqual([])
+    expect(readSearchWarnings({ search: 'not-an-array' })).toEqual([])
+    expect(readSearchWarnings({ search: [{ warnings: [] }] })).toEqual([])
+    expect(readSearchWarnings({ search: [{ warnings: ['plain string'] }] })).toEqual(['plain string'])
+    expect(readSearchWarnings({ search: [{ warnings: [{ field: 'f', message: 'm' }] }] })).toEqual(['f: m'])
   })
 
   it('pairs the updated_at filter with the matching sort key', () => {
@@ -491,6 +532,19 @@ describe('the !input.cursor reconciliation guard', () => {
     expect(world.commandCalls.filter((call) => call.commandId === 'catalog.products.update')).toHaveLength(0)
     expect(batches.at(-1)!.items[0].data.membershipReconciled).toBe(false)
     expect(batches.at(-1)!.message).toContain('Delta sync')
+  })
+
+  it('recovers from an unreadable cursor with a full backfill, and reconciles', async () => {
+    // `parseCursor` returns null for anything it cannot trust — an older encoding, a truncated
+    // write, a hand-edit. There is nowhere to resume from, so the honest move is to re-read
+    // everything via bulk, which is also exactly what makes reconciling correct again.
+    const world = seedReconciliationWorld()
+    const adapter = createShopifyCollectionsAdapter(makeBulkDeps(world, [collectionLine(1, 'Summer')]))
+
+    const batches = await drain(adapter.streamImport!(streamInput({ cursor: '{"v":99,"kind":"nonsense"}' })))
+
+    expect(batches.at(-1)!.items[0].data.membershipReconciled).toBe(true)
+    expect([...world.assignments.get('prod-10')!].sort()).toEqual(['cat-2', 'cat-3'])
   })
 
   it('does not reconcile when a backfill is resumed from a bulk cursor', async () => {
@@ -750,12 +804,12 @@ describe('what the run reports', () => {
     const world = makeWorld()
     const adapter = createShopifyCollectionsAdapter(
       makeBulkDeps(world, [
-        collectionLine(1, 'Smart', { sources: [{ __typename: 'CollectionRuleSource' }] }),
+        collectionLine(1, 'Smart', { sources: [{ __typename: 'CollectionSourceInclusion' }] }),
       ]),
     )
 
     const item = (await drain(adapter.streamImport!(streamInput()))).flatMap((batch) => batch.items)[0]
-    expect(item.data.ruleDriven).toBe(true)
+    expect(item.data.hasUnpreservedSources).toBe(true)
     expect(item.data.ruleSource).toBe('sources')
     expect(item.data.membershipNote).toContain('not preserved')
   })

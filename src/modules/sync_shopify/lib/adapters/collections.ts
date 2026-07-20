@@ -125,12 +125,20 @@ const COLLECTION_SCALAR_FIELDS = `
 /**
  * How we ask whether Shopify computes this collection's membership.
  *
- * Isolated in one constant on purpose: it is the field most likely to move at a quarterly release,
- * and R-3 asks for collection reads to sit behind a single seam for exactly that reason. `sources`
- * replaced `ruleSet` in 2026-07 and is a plain list, so `__typename` alone is a valid selection —
- * and it is deliberately the ONLY thing selected. The rules themselves are not modelled because
- * they cannot be honoured (see the note in `mappers/collection.ts`), and every additional subfield
- * named here is another chance to hard-error the entire sync on a field that got renamed.
+ * Verified against the 2026-07 schema: `sources: [CollectionSource!]!` — a plain non-null LIST (not
+ * a connection, so it adds nothing to the bulk query's connection budget) of an INTERFACE, whose
+ * implementations include `CollectionSourceManual`, `CollectionSourceInclusion` and
+ * `CollectionSourceExclusion`. `__typename` needs no inline fragment on an interface, which is why
+ * it can be selected on its own.
+ *
+ * And on its own is deliberately all we select. The rules themselves are not modelled because they
+ * cannot be honoured (see the note in `mappers/collection.ts`), so every additional subfield named
+ * here would buy nothing while adding one more field that a quarterly release can rename out from
+ * under us — and an unknown field is a hard GraphQL error that fails the whole sync.
+ *
+ * Isolated in one constant because R-3 asks for collection reads to sit behind a single seam. If a
+ * future release rejects this selection, blanking this constant costs only the "rules are not
+ * preserved" diagnostic; nothing else in the adapter reads it.
  */
 const COLLECTION_SOURCE_FIELDS = `
     sources { __typename }
@@ -167,7 +175,8 @@ export function buildCollectionsBulkQuery(): string {
  *
  * `sortKey: UPDATED_AT` is not optional decoration: paired with an `updated_at:>` filter it is what
  * lets Shopify walk the index. Without the matching sort key large collections time out rather
- * than paginate.
+ * than paginate. (Verified present on `CollectionSortKeys` in 2026-07, alongside ID, RELEVANCE and
+ * TITLE — it is the only one of the four that makes an incremental window possible.)
  */
 export function buildCollectionsDeltaQuery(): string {
   return `#graphql
@@ -216,6 +225,42 @@ export function buildCollectionMembersQuery(): string {
 export function buildUpdatedAtFilter(updatedAfter: string | null): string | null {
   if (!updatedAfter) return null
   return `updated_at:>'${updatedAfter}'`
+}
+
+/**
+ * Pull Shopify's search warnings out of a response's `extensions` envelope.
+ *
+ * This is the other half of the defence against R-13. When Shopify ignores a filter it says so in
+ * `extensions.search[].warnings` — never as an error — so a warning here means the delta window was
+ * discarded and this "incremental" run is really a full scan. That matters beyond the cost: a full
+ * scan down the PAGING path saturates at 25,001 objects and truncates without complaint.
+ *
+ * ⚠️ INCOMPLETE BY DEPENDENCY. Shopify only populates `extensions.search` when the request carries
+ * `Shopify-Search-Query-Debug: 1`, and `GraphQLRequestOptions` has no way to set a header today.
+ * Until `client.ts` gains one this parses correctly and simply finds nothing — so it is a live
+ * check the moment the header lands, and not a check that silently passes for a reason nobody
+ * recorded. Written defensively enough to survive whatever shape the envelope turns out to have.
+ */
+export function readSearchWarnings(extensions: Record<string, unknown> | undefined): string[] {
+  const search = extensions?.search
+  if (!Array.isArray(search)) return []
+
+  const warnings: string[] = []
+  for (const entry of search) {
+    const raw = (entry as Record<string, unknown> | null)?.warnings
+    if (!Array.isArray(raw)) continue
+    for (const warning of raw) {
+      if (typeof warning === 'string') {
+        warnings.push(warning)
+        continue
+      }
+      const record = warning as Record<string, unknown> | null
+      const message = typeof record?.message === 'string' ? record.message : null
+      const field = typeof record?.field === 'string' ? record.field : null
+      if (message || field) warnings.push([field, message].filter(Boolean).join(': '))
+    }
+  }
+  return warnings
 }
 
 // ── Injected ports ───────────────────────────────────────────────────────────────────────────
@@ -269,8 +314,9 @@ type ParsedCollection = {
   /**
    * Whether the member list above is the WHOLE list.
    *
-   * False when member paging was cut short. A partial list is fine to add from and fatal to remove
-   * from, so this is checked separately from the full-vs-delta guard.
+   * False when member paging was cut short, or when the rows came from a partial bulk export. A
+   * truncated list is fine to add from and fatal to remove from, which is why this is checked
+   * separately from the full-vs-delta guard: a full run can still hold an incomplete picture.
    */
   membershipComplete: boolean
 }
@@ -282,7 +328,7 @@ type MembershipOutcome = {
   unmappedProductExternalIds: string[]
   /** Per-product write failures, already stringified. */
   errors: string[]
-  /** Whether removals were computed at all, and if not, why. */
+  /** Whether removals were computed at all — false means every gate below was not fully open. */
   reconciled: boolean
 }
 
@@ -444,13 +490,17 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
       // could not be finished. Reported because it is the difference between "this collection has
       // 3 products" and "we managed to read 3 of its products".
       membershipComplete: collection.membershipComplete,
-      // Rules are read from `sources` and cannot be preserved — Shopify evaluates them server-side
-      // and Open Mercato has no rule engine. Reported so the run log says so out loud.
-      ruleDriven: mapped.rules.isRuleDriven,
+      // Read from `sources` and not preservable — Shopify assembles membership server-side and
+      // Open Mercato has no rule engine, nor a column to keep the definition in. Reported so the
+      // run log says so out loud rather than leaving an operator to assume rules round-tripped.
+      hasUnpreservedSources: mapped.rules.hasUnpreservedSources,
       ruleSource: mapped.rules.readFrom,
       ...(mapped.rules.sourceTypes.length > 0 ? { sourceTypes: mapped.rules.sourceTypes } : {}),
-      ...(mapped.rules.isRuleDriven
-        ? { membershipNote: 'Smart-collection rules are not preserved; membership synced as a static snapshot.' }
+      ...(mapped.rules.hasUnpreservedSources
+        ? {
+            membershipNote:
+              'Shopify defines this collection from sources (smart-collection rules and/or curated lists). Those are not preserved; membership is imported as a static snapshot and will drift until the next sync.',
+          }
         : {}),
     }
 
@@ -594,8 +644,15 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
   async function fetchDeltaPage(
     client: ShopifyClient,
     input: { after: string | null; updatedAfter: string | null; pageSize: number; signal?: AbortSignal },
-  ): Promise<{ collections: ParsedCollection[]; endCursor: string | null; hasNextPage: boolean }> {
-    const data = await client.request<{
+  ): Promise<{
+    collections: ParsedCollection[]
+    endCursor: string | null
+    hasNextPage: boolean
+    searchWarnings: string[]
+  }> {
+    // `requestDetailed` rather than `request`: the `extensions` envelope carries the only evidence
+    // that a filter was ignored, and `request` discards it.
+    const { data, extensions } = await client.requestDetailed<{
       collections?: {
         edges?: { node?: unknown }[]
         pageInfo?: { hasNextPage?: boolean; endCursor?: string | null }
@@ -620,7 +677,14 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
       // A node we cannot map is surfaced as a failed item by the caller, which needs the raw node.
       if (!mapped) {
         collections.push({
-          mapped: { externalId: '', name: '', slug: null, description: '', updatedAt: null, rules: { isRuleDriven: false, readFrom: 'none', sourceTypes: [] } },
+          mapped: {
+            externalId: '',
+            name: '',
+            slug: null,
+            description: '',
+            updatedAt: null,
+            rules: { hasUnpreservedSources: false, readFrom: 'none', sourceTypes: [] },
+          },
           productExternalIds: [],
           membershipComplete: false,
         })
@@ -659,6 +723,9 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
       collections,
       endCursor: data?.collections?.pageInfo?.endCursor ?? null,
       hasNextPage: data?.collections?.pageInfo?.hasNextPage === true,
+      // Only meaningful when a filter was actually sent — an unfiltered first page has nothing to
+      // ignore, so a warning there would be noise.
+      searchWarnings: input.updatedAfter ? readSearchWarnings(extensions) : [],
     }
   }
 
@@ -859,6 +926,20 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
 
       const items: ImportItem[] = []
       let maxUpdatedAt: string | null = null
+
+      if (page.searchWarnings.length > 0) {
+        // Shopify ignored our `updated_at` filter, so this run is scanning the whole catalog while
+        // presenting as a delta — and the paging path saturates at 25,001 objects, which truncates
+        // silently. Reported as a failure so the run is visibly not clean.
+        items.push({
+          externalId: `${ENTITY_TYPE.collection}:search_filter_ignored`,
+          action: 'failed',
+          data: {
+            sourceIdentifier: buildUpdatedAtFilter(updatedAfter) ?? '(no filter)',
+            errorMessage: `Shopify ignored the delta filter and returned everything: ${page.searchWarnings.join('; ')}`,
+          },
+        })
+      }
 
       for (const collection of page.collections) {
         if (!collection.mapped.externalId) {

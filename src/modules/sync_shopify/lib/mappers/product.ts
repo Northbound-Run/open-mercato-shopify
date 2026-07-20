@@ -423,6 +423,23 @@ export type PriceIntent = {
 }
 
 /**
+ * The composite external id for one price row, per plan §4.8
+ * (`${variantExternalId}:price:${kind}:${channel}:${currency}` — the channel segment is empty
+ * because Shopify's variant price is not channel-scoped).
+ *
+ * Deterministic on purpose. Because the price kinds are a closed set, every row this adapter could
+ * ever have written for a variant is enumerable from the variant's GID and currency alone — which
+ * is what lets a price that should no longer exist be found and removed without querying for it.
+ */
+export function priceExternalId(
+  variantExternalId: string,
+  kindCode: PriceKindCode,
+  currencyCode: string,
+): string {
+  return `${variantExternalId}:price:${kindCode}::${currencyCode}`
+}
+
+/**
  * Which price rows a variant should have.
  *
  * ⚠ The direction here is the opposite of how plan §5.1 reads. Shopify's `price` is what the
@@ -451,7 +468,7 @@ export function toPriceIntents(
     kindCode,
     amount,
     currencyCode,
-    externalId: `${variant.id}:price:${kindCode}::${currencyCode}`,
+    externalId: priceExternalId(variant.id, kindCode, currencyCode),
   })
 
   return onSale
