@@ -1,6 +1,7 @@
 import { createAdminApiClient } from '@shopify/admin-api-client'
 import { DEFAULT_API_VERSION } from './constants'
-import { normalizeShopDomain } from './oauth'
+import { normalizeShopDomain } from './shop-domain'
+import type { TokenProvider } from './token'
 import {
   CostTracker,
   computeBackoffMs,
@@ -15,21 +16,24 @@ import {
  * Shopify Admin GraphQL client.
  *
  * `@shopify/admin-api-client` owns the wire — URL and header construction, API version pinning,
- * deprecation notices — and we own the pacing. That split is deliberate: the SDK's `retries`
- * option fires only on HTTP 429/503, whereas Shopify signals cost throttling on an **HTTP 200**
- * with `errors[].extensions.code === 'THROTTLED'`. Cost-aware retry therefore has to live here
- * regardless of which transport is underneath.
+ * deprecation notices — and we own pacing and token lifecycle. That split is deliberate:
+ *
+ *  - The SDK's `retries` fires only on HTTP 429/503, whereas Shopify signals cost throttling on
+ *    an HTTP 200 with `errors[].extensions.code === 'THROTTLED'`.
+ *  - Client-credentials tokens live 24 hours with no refresh token, so a long backfill can
+ *    outlive its own token. The token is therefore fetched per request from a provider and
+ *    re-minted on a 401, rather than captured once at construction.
  *
  * All SDK usage is confined to this file, so swapping to raw fetch later is a local change.
  */
 
 export type ShopifyClientOptions = {
   shopDomain: string
-  accessToken: string
+  tokenProvider: TokenProvider
   apiVersion?: string
-  /** Injected in tests. Passed straight through to the SDK. */
+  /** Injected in tests. */
   customFetchApi?: typeof fetch
-  /** Retries for throttling and transient failures. Does not apply to permanent errors. */
+  /** Retries for throttling, token expiry and transient failures — not for permanent errors. */
   maxRetries?: number
   /** Ceiling on a single backoff wait, so a starved bucket cannot stall a run indefinitely. */
   backoffCapMs?: number
@@ -73,27 +77,37 @@ export function createShopifyClient(options: ShopifyClientOptions): ShopifyClien
   const sleep = options.sleep ?? defaultSleep
   const tracker = new CostTracker()
 
-  const client = createAdminApiClient({
-    storeDomain: shopDomain,
-    apiVersion,
-    accessToken: options.accessToken,
-    userAgentPrefix: 'open-mercato-sync-shopify',
-    // Left at 0 on purpose: the SDK's retry cannot see HTTP-200 throttling, so retrying is
-    // handled below where the cost data is actually available.
-    retries: 0,
-    ...(options.customFetchApi ? { customFetchApi: options.customFetchApi } : {}),
-    ...(options.onDeprecation
-      ? {
-          logger: (log: { type?: string; content?: unknown }) => {
-            // Quarterly API releases are real breaking boundaries; surface deprecations early
-            // rather than discovering them when a version is retired.
-            if (log?.type === 'HTTP-Response-GraphQL-Deprecation-Notice') {
-              options.onDeprecation?.(JSON.stringify(log.content))
-            }
-          },
-        }
-      : {}),
-  })
+  // The SDK holds a static accessToken, so a client is built per token. Tokens change rarely
+  // (once a day), and construction is cheap — it allocates no connections.
+  let clientToken: string | null = null
+  let client: ReturnType<typeof createAdminApiClient> | null = null
+
+  function clientFor(accessToken: string) {
+    if (client && clientToken === accessToken) return client
+    clientToken = accessToken
+    client = createAdminApiClient({
+      storeDomain: shopDomain,
+      apiVersion,
+      accessToken,
+      userAgentPrefix: 'open-mercato-sync-shopify',
+      // Left at 0 on purpose: the SDK's retry cannot see HTTP-200 throttling, so retrying is
+      // handled below where the cost data is actually available.
+      retries: 0,
+      ...(options.customFetchApi ? { customFetchApi: options.customFetchApi } : {}),
+      ...(options.onDeprecation
+        ? {
+            logger: (log: { type?: string; content?: unknown }) => {
+              // Quarterly API releases are real breaking boundaries; surface deprecations early
+              // rather than discovering them when a version is retired.
+              if (log?.type === 'HTTP-Response-GraphQL-Deprecation-Notice') {
+                options.onDeprecation?.(JSON.stringify(log.content))
+              }
+            },
+          }
+        : {}),
+    })
+    return client
+  }
 
   async function request<TData = unknown>(
     query: string,
@@ -101,6 +115,7 @@ export function createShopifyClient(options: ShopifyClientOptions): ShopifyClien
   ): Promise<TData> {
     const { variables, estimatedCost, signal } = requestOptions
     let lastCost: QueryCost | null = null
+    let tokenRetried = false
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       signal?.throwIfAborted()
@@ -109,7 +124,11 @@ export function createShopifyClient(options: ShopifyClientOptions): ShopifyClien
       const preDelay = estimatedCost ? tracker.delayForMs(estimatedCost) : 0
       if (preDelay > 0) await sleep(Math.min(preDelay, backoffCapMs))
 
-      const response = await client.request<TData>(query, variables ? { variables } : undefined)
+      const token = await options.tokenProvider.getToken()
+      const response = await clientFor(token.accessToken).request<TData>(
+        query,
+        variables ? { variables } : undefined,
+      )
 
       lastCost = parseCost(response.extensions)
       tracker.observe(lastCost)
@@ -137,10 +156,16 @@ export function createShopifyClient(options: ShopifyClientOptions): ShopifyClien
           .map((e) => (e.extensions as Record<string, unknown> | undefined)?.code)
           .filter((c): c is string => typeof c === 'string')
         const messages = errors.map((e) => e.message).filter(Boolean).join('; ')
-
-        // Auth failures must be distinguishable so the health check can flag re-auth rather
-        // than reporting a generic outage.
         const isAuth = codes.some((c) => ['ACCESS_DENIED', 'UNAUTHORIZED'].includes(c.toUpperCase()))
+
+        // A 24-hour token can expire mid-backfill. Re-mint once and retry before concluding the
+        // credentials are bad — otherwise a long run dies of old age rather than of a real fault.
+        if (isAuth && !tokenRetried) {
+          tokenRetried = true
+          options.tokenProvider.invalidate()
+          continue
+        }
+
         throw new ShopifyApiError(
           isAuth ? 'unauthorized' : 'graphql_error',
           `[internal] Shopify GraphQL error: ${messages || codes.join(',') || 'unknown'}`,

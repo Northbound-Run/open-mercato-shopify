@@ -1,7 +1,7 @@
 import type { AwilixContainer } from 'awilix'
 import type { IntegrationScope } from '@open-mercato/shared/modules/integrations/types'
 import { BUNDLE_ID, DEFAULT_API_VERSION } from './constants'
-import { normalizeShopDomain } from './oauth'
+import { normalizeShopDomain } from './shop-domain'
 
 /**
  * Optional environment bootstrap for single-store deployments.
@@ -18,7 +18,6 @@ export const ENV_KEYS = {
   shopDomain: 'OM_INTEGRATION_SHOPIFY_SHOP_DOMAIN',
   clientId: 'OM_INTEGRATION_SHOPIFY_CLIENT_ID',
   clientSecret: 'OM_INTEGRATION_SHOPIFY_CLIENT_SECRET',
-  accessToken: 'OM_INTEGRATION_SHOPIFY_ACCESS_TOKEN',
   apiVersion: 'OM_INTEGRATION_SHOPIFY_API_VERSION',
 } as const
 
@@ -26,7 +25,6 @@ export type ShopifyEnvPreset = {
   shopDomain: string
   clientId?: string
   clientSecret?: string
-  accessToken?: string
   apiVersion: string
 }
 
@@ -42,7 +40,6 @@ export function readShopifyEnvPreset(env: NodeJS.ProcessEnv = process.env): Shop
     shopDomain,
     clientId: env[ENV_KEYS.clientId]?.trim() || undefined,
     clientSecret: env[ENV_KEYS.clientSecret]?.trim() || undefined,
-    accessToken: env[ENV_KEYS.accessToken]?.trim() || undefined,
     apiVersion: env[ENV_KEYS.apiVersion]?.trim() || DEFAULT_API_VERSION,
   }
 }
@@ -69,7 +66,6 @@ export function mergePreset(
   apply('shopDomain', preset.shopDomain)
   apply('clientId', preset.clientId)
   apply('clientSecret', preset.clientSecret)
-  apply('accessToken', preset.accessToken)
   apply('apiVersion', preset.apiVersion)
 
   return { merged, changed }

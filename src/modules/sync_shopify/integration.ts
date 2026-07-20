@@ -21,11 +21,14 @@ const PACKAGE_NAME = '@northbound-run/sync-shopify'
  * `bundleId` and inherits its credentials. Credential resolution falls through from the
  * integration to the bundle, so the merchant connects once and enables entities independently.
  *
- * NOTE ON OAUTH: we deliberately do NOT use the framework's declarative `oauth` credential-field
- * type here. It takes static `authUrl`/`tokenUrl`, but Shopify's OAuth endpoints are per-shop
- * (`https://{shop}.myshopify.com/admin/oauth/...`) and therefore only knowable after
- * `shopDomain` is entered. We drive the flow from our own api/oauth/{authorize,callback} routes
- * instead, which build the URL from the stored shopDomain.
+ * AUTH: this uses Shopify's **client credentials grant** — the app exchanges its own client ID
+ * and secret for a token, with no redirect, no browser round-trip and no user session. Shopify
+ * restricts that grant to apps installed in stores you own, which is exactly the self-hosted
+ * case here.
+ *
+ * The consequence worth knowing: authentication works headlessly, so a scheduled worker can mint
+ * its own token. There is therefore no `oauth` credential field and no callback route — the
+ * access token is derived at runtime, never entered by hand.
  */
 export const bundle: IntegrationBundle = {
   id: BUNDLE_ID,
@@ -58,7 +61,7 @@ export const bundle: IntegrationBundle = {
         type: 'secret',
         required: true,
         helpText:
-          'The value beginning shpss_. Used both for the OAuth exchange and to verify webhook signatures.',
+          'The value beginning shpss_. Used to obtain access tokens and to verify webhook signatures.',
       },
       {
         key: 'apiVersion',
@@ -72,15 +75,8 @@ export const bundle: IntegrationBundle = {
         helpText:
           'Pin to a supported version. Older versions silently omit collections that use the 2026-07 model.',
       },
-      {
-        key: 'accessToken',
-        label: 'Admin API access token',
-        type: 'secret',
-        required: false,
-        placeholder: 'shpat_…',
-        helpText:
-          'Set automatically when you connect via OAuth. Only enter this by hand if you already hold a token from a pre-existing custom app.',
-      },
+      // No access-token field: tokens are minted on demand from the client credentials and live
+      // only 24 hours, so there is nothing durable for an operator to paste.
     ],
   },
 }

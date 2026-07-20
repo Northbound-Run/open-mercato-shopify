@@ -1,7 +1,8 @@
 import type { IntegrationScope } from '@open-mercato/shared/modules/integrations/types'
 import { createShopifyClient, ShopifyApiError } from './client'
 import { DEFAULT_API_VERSION, REQUIRED_SCOPES } from './constants'
-import { missingScopes, orderHistoryWindow } from './oauth'
+import { missingScopes, orderHistoryWindow, ShopifyAuthError } from './shop-domain'
+import { createTokenProvider } from './token'
 
 /**
  * Health probe for the Shopify connection.
@@ -9,8 +10,9 @@ import { missingScopes, orderHistoryWindow } from './oauth'
  * Registered in DI under the name declared by `integration.healthCheck.service`; the framework's
  * health service resolves it by that name and races it against a 10s timeout.
  *
- * The probe is a `shop { name }` query — the cheapest authenticated call available, costing 1
- * point, which confirms the token, the shop domain and the API version in a single round trip.
+ * The probe mints a token via the client credentials grant and then runs `shop { name }` — the
+ * cheapest authenticated call available at 1 point. That exercises the whole chain (credentials
+ * → token → API) in two round trips, so a green health check genuinely means a sync would work.
  */
 
 export type HealthCheckResult = {
@@ -44,31 +46,57 @@ export const shopifyHealthCheck = {
     credentials: Record<string, unknown> | null,
     _scope: IntegrationScope,
   ): Promise<HealthCheckResult> {
-    const shopDomain = typeof credentials?.shopDomain === 'string' ? credentials.shopDomain : ''
-    const accessToken = typeof credentials?.accessToken === 'string' ? credentials.accessToken : ''
-    const apiVersion =
-      typeof credentials?.apiVersion === 'string' && credentials.apiVersion
-        ? credentials.apiVersion
-        : DEFAULT_API_VERSION
+    const str = (key: string): string =>
+      typeof credentials?.[key] === 'string' ? (credentials[key] as string).trim() : ''
 
-    if (!shopDomain) {
+    const shopDomain = str('shopDomain')
+    const clientId = str('clientId')
+    const clientSecret = str('clientSecret')
+    const apiVersion = str('apiVersion') || DEFAULT_API_VERSION
+
+    const missingConfig = [
+      !shopDomain && 'shopDomain',
+      !clientId && 'clientId',
+      !clientSecret && 'clientSecret',
+    ].filter(Boolean) as string[]
+
+    if (missingConfig.length > 0) {
       return {
         status: 'unhealthy',
-        message: 'No shop domain configured.',
-        details: { code: 'not_configured' },
-      }
-    }
-    if (!accessToken) {
-      // Distinct from a bad token: nothing has been connected yet, so prompt to connect rather
-      // than to re-authorize.
-      return {
-        status: 'unhealthy',
-        message: 'Not connected. Complete the Shopify authorization to obtain an access token.',
-        details: { code: 'not_connected', reauthRequired: true },
+        message: `Not configured. Missing: ${missingConfig.join(', ')}.`,
+        details: { code: 'not_configured', missing: missingConfig, reauthRequired: false },
       }
     }
 
-    const client = createShopifyClient({ shopDomain, accessToken, apiVersion })
+    const tokenProvider = createTokenProvider({ shopDomain, clientId, clientSecret })
+
+    // Step 1: can we mint a token at all? Failing here is a credentials problem, and is worth
+    // distinguishing from the store being unreachable.
+    let grantedScopes: string[]
+    try {
+      const token = await tokenProvider.getToken()
+      grantedScopes = token.grantedScopes
+    } catch (error) {
+      if (error instanceof ShopifyAuthError) {
+        const isCredentialFault = error.code === 'invalid_client' || error.code === 'invalid_shop'
+        return {
+          status: 'unhealthy',
+          message: isCredentialFault
+            ? 'Shopify rejected the client ID or secret. Check the credentials, and that the app is installed on this store.'
+            : 'Could not obtain an access token from Shopify.',
+          details: { code: error.code, reauthRequired: isCredentialFault },
+        }
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        status: 'unhealthy',
+        message: 'Could not obtain an access token from Shopify.',
+        details: { code: 'token_request_failed', reauthRequired: false, error: message },
+      }
+    }
+
+    // Step 2: does the token actually work against the Admin API?
+    const client = createShopifyClient({ shopDomain, tokenProvider, apiVersion })
 
     let data: ShopProbeData
     try {
@@ -77,13 +105,13 @@ export const shopifyHealthCheck = {
       if (error instanceof ShopifyApiError && error.code === 'unauthorized') {
         return {
           status: 'unhealthy',
-          message: 'Shopify rejected the access token. Re-authorize the connection.',
+          message: 'Shopify rejected the access token. Confirm the app is installed on this store.',
           details: { code: 'unauthorized', reauthRequired: true },
         }
       }
       if (error instanceof ShopifyApiError && error.code === 'throttled') {
-        // Throttling means the credentials are fine and the store is reachable — that is a
-        // degraded connection, not a broken one.
+        // Throttling means the credentials are fine and the store is reachable — degraded, not
+        // broken.
         return {
           status: 'degraded',
           message: 'Shopify is rate limiting requests.',
@@ -107,29 +135,26 @@ export const shopifyHealthCheck = {
       }
     }
 
-    // A narrower-than-requested grant is silent on Shopify's side — surface it here, because
-    // otherwise it shows up as a mid-run failure on one entity type.
-    const granted =
-      typeof credentials?.grantedScopes === 'string' && credentials.grantedScopes
-        ? credentials.grantedScopes.split(',').map((s) => s.trim()).filter(Boolean)
-        : []
-    const missing = granted.length > 0 ? missingScopes(granted, REQUIRED_SCOPES) : []
-
     const details: Record<string, unknown> = {
       shopName: shop.name,
       myshopifyDomain: shop.myshopifyDomain,
       currencyCode: shop.currencyCode,
       plan: shop.plan?.displayName,
       apiVersion,
+      grantedScopes,
+      orderHistoryWindow: orderHistoryWindow(grantedScopes),
       reauthRequired: false,
-      orderHistoryWindow: granted.length > 0 ? orderHistoryWindow(granted) : 'unknown',
     }
 
+    // Scopes are configured on the app, not requested per token, so a misconfigured app yields a
+    // valid token that silently cannot read one entity type. Surface it here rather than letting
+    // it fail mid-run.
+    const missing = missingScopes(grantedScopes, REQUIRED_SCOPES)
     if (missing.length > 0) {
       return {
         status: 'degraded',
-        message: `Connected, but missing scopes: ${missing.join(', ')}. Re-authorize to grant them.`,
-        details: { ...details, code: 'partial_scopes', missingScopes: missing, reauthRequired: true },
+        message: `Connected, but the app is missing scopes: ${missing.join(', ')}. Add them in the Dev Dashboard and release a new app version.`,
+        details: { ...details, code: 'partial_scopes', missingScopes: missing },
       }
     }
 
