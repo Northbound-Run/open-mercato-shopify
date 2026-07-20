@@ -47,6 +47,9 @@ export const MAPPING_ENTITY_TYPE = {
   // ownership-gated on this mapping existing.
   customerAddress: 'customer_address',
   salesOrder: 'sales_order',
+  salesOrderLine: 'sales_order_line',
+  salesPayment: 'sales_payment',
+  salesShipment: 'sales_shipment',
 } as const
 
 // ── DOT dialect: CommandBus command ids ─────────────────────────────────────────────────────
@@ -73,6 +76,18 @@ export const COMMAND = {
   addressCreate: 'customers.addresses.create',
   addressUpdate: 'customers.addresses.update',
   addressDelete: 'customers.addresses.delete',
+  orderCreate: 'sales.orders.create',
+  orderUpdate: 'sales.orders.update',
+  orderDelete: 'sales.orders.delete',
+  orderLineUpsert: 'sales.orders.lines.upsert',
+  orderLineDelete: 'sales.orders.lines.delete',
+  orderAdjustmentUpsert: 'sales.orders.adjustments.upsert',
+  orderAdjustmentDelete: 'sales.orders.adjustments.delete',
+  paymentCreate: 'sales.payments.create',
+  paymentUpdate: 'sales.payments.update',
+  paymentDelete: 'sales.payments.delete',
+  shipmentCreate: 'sales.shipments.create',
+  shipmentUpdate: 'sales.shipments.update',
 } as const
 
 /**
@@ -93,6 +108,12 @@ export const COMMAND_RESULT_KEY = {
   category: 'categoryId',
   person: 'entityId',
   address: 'addressId',
+  order: 'orderId',
+  // sales.orders.lines.upsert returns { orderId, lineId } — the line's own id is `lineId`.
+  orderLine: 'lineId',
+  // sales.payments.create returns { paymentId, orderTotals?, ... } — read `paymentId`.
+  payment: 'paymentId',
+  shipment: 'shipmentId',
 } as const
 
 // ── Integration + provider identity ─────────────────────────────────────────────────────────
