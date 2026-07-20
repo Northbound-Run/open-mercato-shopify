@@ -20,6 +20,7 @@ export const ENTITY_TYPE = {
   collection: 'shopify.collection',
   customer: 'shopify.customer',
   order: 'shopify.order',
+  inventoryLevel: 'shopify.inventory_level',
 } as const
 
 export type ShopifyEntityType = (typeof ENTITY_TYPE)[keyof typeof ENTITY_TYPE]
@@ -71,6 +72,7 @@ export const INTEGRATION_ID = {
   collections: 'sync_shopify_collections',
   customers: 'sync_shopify_customers',
   orders: 'sync_shopify_orders',
+  inventory: 'sync_shopify_inventory',
 } as const
 
 export const PROVIDER_KEY = {
@@ -78,7 +80,28 @@ export const PROVIDER_KEY = {
   collections: 'shopify_collections',
   customers: 'shopify_customers',
   orders: 'shopify_orders',
+  inventory: 'shopify_inventory',
 } as const
+
+// ── Inventory history (the one module-owned table — see plan §12) ────────────────────────────
+export const INVENTORY_TABLE = 'sync_shopify_inventory_snapshots'
+
+/**
+ * Minimum evidence before an out-of-stock ratio may be reported.
+ *
+ * History cannot be backfilled — it accrues only forward — so a fresh install has no valid ratio
+ * for months while still looking authoritative. Missed runs shrink the denominator the same way.
+ * Below these thresholds `oosRatio` returns null and NO custom field is written (writing 0 would
+ * read as "never out of stock"). This number feeds purchase-order quantities.
+ */
+export const OOS_MIN_OBSERVED_DAYS = 14
+export const OOS_MIN_WINDOW_COVERAGE = 0.5
+
+/** Default window for the rolling custom field. */
+export const OOS_DEFAULT_WINDOW_DAYS = 90
+
+/** Retention: keep daily rows this long (covers year-over-year), then roll up to monthly. */
+export const INVENTORY_DAILY_RETENTION_DAYS = 396
 
 // The DI name our health-check service registers under. `integration.healthCheck.service` must
 // match it exactly — the health service resolves it by name from the container.
