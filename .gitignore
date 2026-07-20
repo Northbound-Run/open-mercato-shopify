@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.yarn/
+.pnp.*
+yarn-error.log
+coverage/
+*.log
+.turbo/
+.DS_Store
+.mercato/
+.env
+.env.local
+
+# OMC tooling session state (plans are kept, state is not)
+.omc/state/
+.omc/**/.omc/
