@@ -42,6 +42,10 @@ export const MAPPING_ENTITY_TYPE = {
   productOffer: 'catalog_product_offer',
   productCategory: 'catalog_product_category',
   customerEntity: 'customer_entity',
+  // Addresses are mapped in their own right, not folded into the customer: they are reconciled
+  // per customer (Shopify sends the whole set, so a deleted one is simply absent), and deletion is
+  // ownership-gated on this mapping existing.
+  customerAddress: 'customer_address',
   salesOrder: 'sales_order',
 } as const
 
