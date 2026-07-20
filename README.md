@@ -144,8 +144,17 @@ oos_ratio = days_out_of_stock / days_observed
 effective_daily_demand = recorded_sales / (days_observed × (1 − oos_ratio))
 ```
 
-Written back as `cf:oos_ratio_90d` on the variant, and `cf:unit_cost` from Shopify's `unitCost`
-(which unblocks margin/P&L).
+Written back to the native variant as custom fields, so a downstream module (a purchasing /
+PO-drafting tool, a report) reads current stock and the derived signal off a stable `cf:` seam and
+never has to touch this connector's snapshot table:
+
+| Field | Meaning |
+|---|---|
+| `cf:on_hand` | current on-hand, summed across the variant's locations |
+| `cf:available` | current available (sellable), summed across locations |
+| `cf:oos_ratio_90d` | out-of-stock ratio over the window (written only when there is enough history) |
+| `cf:days_out_of_stock_90d` | days out of stock over the window |
+| `cf:unit_cost` | Shopify's `unitCost` — unblocks margin/P&L |
 
 > **The ratio is guarded.** History cannot be backfilled — it accrues forward only — so a fresh
 > install has no valid ratio for ~90 days. Below a minimum of 14 observed days and 50% window

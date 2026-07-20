@@ -107,6 +107,12 @@ export const INVENTORY_CUSTOM_FIELD = {
   unitCost: 'unit_cost',
   oosRatio: 'oos_ratio_90d',
   daysOutOfStock: 'days_out_of_stock_90d',
+  // Current-state on-hand and available, written on the same pass as the snapshot. These exist so a
+  // downstream consumer (e.g. a purchasing / PO-drafting module) reads current stock off a stable
+  // `cf:` seam on the native variant, and never has to reach into this connector's private snapshot
+  // table. Aggregated across the variant's locations — see `writeBackCustomFields`.
+  onHand: 'on_hand',
+  available: 'available',
 } as const
 
 // ── GraphQL ─────────────────────────────────────────────────────────────────────────────────────
@@ -575,6 +581,19 @@ export function createShopifyInventoryAdapter(deps: InventoryAdapterDeps): DataS
     if (mapped.unitCost !== null) values[INVENTORY_CUSTOM_FIELD.unitCost] = mapped.unitCost
 
     if (context.hasRows) {
+      // Current-state stock, summed across the variant's locations. `hasRows` guarantees every row
+      // carries a real `available`/`onHand` — a location that reported no `available` was skipped
+      // upstream, never written as 0 — so this sums only OBSERVED locations and never fabricates a
+      // phantom zero. For a single-location store it is simply that location's value.
+      let onHand = 0
+      let available = 0
+      for (const row of mapped.rows) {
+        onHand += row.onHand
+        available += row.available
+      }
+      values[INVENTORY_CUSTOM_FIELD.onHand] = onHand
+      values[INVENTORY_CUSTOM_FIELD.available] = available
+
       const result = await historyService.oosRatio(mapped.variantExternal, {
         scope: context.scope,
         asOf: context.snapshotDate,

@@ -696,6 +696,55 @@ describe('createShopifyInventoryAdapter', () => {
     expect(customFieldCalls[0].values[INVENTORY_CUSTOM_FIELD.unitCost]).toBe('12.5000')
   })
 
+  // Current-state stock is the consumer seam a downstream PO-drafting module reads instead of this
+  // connector's private snapshot table.
+  it('writes current on_hand and available for a single-location variant', async () => {
+    const { adapter, customFieldCalls } = createHarness({
+      pages: onePage([variantNode({ levels: [{ locationId: LOCATION_A, available: 5, onHand: 7 }] })]),
+    })
+
+    await drain(adapter, importInput())
+
+    const values = customFieldCalls[0].values
+    expect(values[INVENTORY_CUSTOM_FIELD.onHand]).toBe(7)
+    expect(values[INVENTORY_CUSTOM_FIELD.available]).toBe(5)
+  })
+
+  it('sums current on_hand and available across a variant stocked at two locations', async () => {
+    const { adapter, customFieldCalls } = createHarness({
+      pages: onePage([
+        variantNode({
+          levels: [
+            { locationId: LOCATION_A, available: 5, onHand: 7 },
+            { locationId: LOCATION_B, available: 3, onHand: 4 },
+          ],
+        }),
+      ]),
+    })
+
+    await drain(adapter, importInput())
+
+    const values = customFieldCalls[0].values
+    expect(values[INVENTORY_CUSTOM_FIELD.onHand]).toBe(11)
+    expect(values[INVENTORY_CUSTOM_FIELD.available]).toBe(8)
+  })
+
+  it('never writes current stock for a variant that produced no rows (no phantom zero)', async () => {
+    // A gift card is not physical inventory, so it yields no rows. Its unit cost still travels (a
+    // cost is a catalog fact), which gives us a custom-field call to inspect — and that call must
+    // carry NO on_hand/available, because a stored 0 would read as real, empty stock.
+    const { adapter, customFieldCalls } = createHarness({
+      pages: onePage([variantNode({ isGiftCard: true, unitCost: '5.0000' })]),
+    })
+
+    await drain(adapter, importInput())
+
+    const values = customFieldCalls[0].values
+    expect(values[INVENTORY_CUSTOM_FIELD.unitCost]).toBe('5.0000')
+    expect(values).not.toHaveProperty(INVENTORY_CUSTOM_FIELD.onHand)
+    expect(values).not.toHaveProperty(INVENTORY_CUSTOM_FIELD.available)
+  })
+
   it('omits unit_cost rather than blanking it when Shopify has none', async () => {
     const { adapter, customFieldCalls } = createHarness({
       pages: onePage([variantNode({ unitCost: null })]),
@@ -703,9 +752,13 @@ describe('createShopifyInventoryAdapter', () => {
 
     await drain(adapter, importInput())
 
-    // Nothing to write at all: no ratio yet, no unit cost. `setCustomFieldsIfAny` must not be
-    // reached with a null, because a per-key null blanks the stored value.
-    expect(customFieldCalls).toHaveLength(0)
+    // `unit_cost` is omitted, not blanked: a per-key null would blank the stored value, so a null
+    // cost must never reach `setCustomFieldsIfAny`. The variant is still physical with observed
+    // stock, so on_hand/available are written — the cost is simply absent from that map.
+    const values = customFieldCalls[0].values
+    expect(values).not.toHaveProperty(INVENTORY_CUSTOM_FIELD.unitCost)
+    expect(values[INVENTORY_CUSTOM_FIELD.onHand]).toBe(7)
+    expect(values[INVENTORY_CUSTOM_FIELD.available]).toBe(5)
   })
 
   it('does NOT write oos_ratio when the evidence is insufficient', async () => {
