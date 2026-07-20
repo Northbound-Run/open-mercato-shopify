@@ -16,3 +16,7 @@ coverage/
 .omc/**/.omc/
 **/.omc/state/
 src/**/.omc/
+
+# Internal planning/handoff docs — not for the public package repo (kept locally / in scratchpad).
+HANDOFF.md
+.omc/

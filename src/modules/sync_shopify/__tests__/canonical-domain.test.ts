@@ -34,9 +34,9 @@ function stub(myshopifyDomain: string) {
 
 const step = (steps: ProbeStep[], name: string) => steps.find((s) => s.name === name)
 
-// Observed against a real store: connecting as mystore.myshopify.com returned a canonical
-// myshopifyDomain of store-internal-42.myshopify.com. Left unflagged, two integrations reaching one store
-// via different aliases would be treated as two stores and duplicate every record.
+// A store can answer on a human-readable alias domain while reporting a different, internal-id
+// canonical `myshopifyDomain`. Left unflagged, two integrations reaching one store via different
+// aliases would be treated as two stores and duplicate every record.
 describe('canonical domain reconciliation', () => {
   it('warns when the store reports a different canonical domain', async () => {
     const result = await probeConnection({ ...BASE, fetchImpl: stub('store-internal-42.myshopify.com') as never })
