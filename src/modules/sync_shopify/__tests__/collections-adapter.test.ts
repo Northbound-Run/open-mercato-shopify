@@ -804,7 +804,7 @@ describe('what the run reports', () => {
     const world = makeWorld()
     const adapter = createShopifyCollectionsAdapter(
       makeBulkDeps(world, [
-        collectionLine(1, 'Smart', { sources: [{ __typename: 'CollectionSourceInclusion' }] }),
+        collectionLine(1, 'Smart', { sources: [{ __typename: 'CollectionConditionsSource' }] }),
       ]),
     )
 

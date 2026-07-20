@@ -58,14 +58,18 @@ export type CollectionRuleInfo = {
    * Shopify holds membership-defining metadata for this collection — 2026-07 `sources`, or a
    * legacy `ruleSet` carrying rules — that we do not and cannot preserve.
    *
-   * Deliberately NOT called `isRuleDriven`. `sources` is a list of an interface
-   * (`[CollectionSource!]!`) whose implementations include both condition-bearing kinds
-   * (`CollectionSourceInclusion`, `CollectionSourceExclusion`) and, on the evidence available,
-   * possibly a curated-list kind too. Telling those apart means hard-coding concrete type names,
-   * and the names are exactly what a quarterly release renames. So this flag answers the question
-   * we can actually answer — "is there upstream definition metadata we dropped?" — and errs toward
-   * saying yes. Over-warning costs a line in a run log; under-warning lets an operator believe
-   * smart-collection rules survived the import.
+   * Deliberately NOT called `isRuleDriven`. `sources` is `[CollectionSource!]!`, a list of an
+   * interface with exactly two implementations in 2026-07: `CollectionConditionsSource` (carries
+   * `inclusion`/`exclusion` conditions — smart-collection rules) and
+   * `CollectionSubCollectionsSource` (membership composed from other collections). Both are
+   * server-computed and neither is a hand-curated product list, so a genuinely manual collection
+   * has no sources at all and this flag stays false for it.
+   *
+   * The name still avoids "rule" because sub-collection composition is not a rule, and because
+   * pinning behaviour to concrete type names is what a quarterly release breaks. This asks the
+   * question we can answer from `__typename` alone — "is there upstream definition metadata we
+   * dropped?" — and errs toward saying yes. Over-warning costs a line in a run log; under-warning
+   * lets an operator believe smart-collection rules survived the import.
    */
   hasUnpreservedSources: boolean
   /**

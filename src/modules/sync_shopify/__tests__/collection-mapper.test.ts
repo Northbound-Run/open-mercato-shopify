@@ -124,21 +124,36 @@ describe('readRuleInfo — the 2026-07 sources model', () => {
   it('reads `sources` and flags the definition as unpreserved', () => {
     const info = readRuleInfo({
       ...BASE,
-      sources: [{ __typename: 'CollectionSourceInclusion' }, { __typename: 'CollectionSourceInclusion' }],
+      sources: [{ __typename: 'CollectionConditionsSource' }, { __typename: 'CollectionConditionsSource' }],
     })
     expect(info).toEqual({
       hasUnpreservedSources: true,
       readFrom: 'sources',
       // Deduplicated: the point is to notice an unfamiliar type name after an API bump, not to
       // count occurrences.
-      sourceTypes: ['CollectionSourceInclusion'],
+      sourceTypes: ['CollectionConditionsSource'],
     })
+  })
+
+  it('flags a sub-collections source too — not only rule-bearing ones', () => {
+    // `CollectionSubCollectionsSource` composes membership from other collections. It is not a
+    // "rule", but it is still server-computed definition metadata we drop, so it counts. Both
+    // concrete 2026-07 types deduplicate into `sourceTypes`.
+    const info = readRuleInfo({
+      ...BASE,
+      sources: [
+        { __typename: 'CollectionConditionsSource' },
+        { __typename: 'CollectionSubCollectionsSource' },
+      ],
+    })
+    expect(info.hasUnpreservedSources).toBe(true)
+    expect(info.sourceTypes.sort()).toEqual(['CollectionConditionsSource', 'CollectionSubCollectionsSource'])
   })
 
   it('reads `sources` in connection form too, in case a release changes its shape', () => {
     const info = readRuleInfo({
       ...BASE,
-      sources: { edges: [{ node: { __typename: 'CollectionSourceInclusion' } }] },
+      sources: { edges: [{ node: { __typename: 'CollectionConditionsSource' } }] },
     })
     expect(info.hasUnpreservedSources).toBe(true)
     expect(info.readFrom).toBe('sources')
@@ -148,7 +163,7 @@ describe('readRuleInfo — the 2026-07 sources model', () => {
     // On 2026-07 both can appear. `ruleSet` is the deprecated one and is the one that will vanish.
     const info = readRuleInfo({
       ...BASE,
-      sources: [{ __typename: 'CollectionSourceInclusion' }],
+      sources: [{ __typename: 'CollectionConditionsSource' }],
       ruleSet: { appliedDisjunctively: false, rules: [{ column: 'TAG', relation: 'EQUALS', condition: 'sale' }] },
     })
     expect(info.readFrom).toBe('sources')
@@ -185,7 +200,7 @@ describe('readRuleInfo — the 2026-07 sources model', () => {
   })
 
   it('surfaces source information through mapCollection, where the adapter reads it', () => {
-    const mapped = mapCollection({ ...BASE, sources: [{ __typename: 'CollectionSourceInclusion' }] })
+    const mapped = mapCollection({ ...BASE, sources: [{ __typename: 'CollectionConditionsSource' }] })
     expect(mapped!.rules.hasUnpreservedSources).toBe(true)
   })
 })
