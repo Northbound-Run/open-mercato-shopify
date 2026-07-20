@@ -16,6 +16,7 @@ export class Migration20260720120000_sync_shopify extends Migration {
       "variant_external" text not null,
       "sku" text null,
       "product_type" text null,
+      "product_status" text null,
       "location_id" text not null,
       "on_hand" int not null,
       "available" int not null,

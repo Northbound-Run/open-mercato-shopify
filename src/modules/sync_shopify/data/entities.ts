@@ -76,6 +76,18 @@ export class ShopifyInventorySnapshot {
   @Property({ name: 'product_type', type: 'text', nullable: true })
   productType?: string | null
 
+  /**
+   * Shopify `ProductStatus` verbatim — ACTIVE, ARCHIVED or DRAFT.
+   *
+   * Inactive products ARE snapshotted (plan §12.10): excluding them would leave an unfillable hole,
+   * and archiving stock off-season then restoring it is routine in this domain, which would cost
+   * 14+ days of unusable out-of-stock ratio after every restore. Recording the status is what keeps
+   * that inclusive capture honest — without it, "archived" and "live" are indistinguishable in
+   * history and a demand-planning consumer cannot filter to sellable SKUs.
+   */
+  @Property({ name: 'product_status', type: 'text', nullable: true })
+  productStatus?: string | null
+
   /** Shopify Location GID. Multi-location-ready from day one, not retrofitted. */
   @Property({ name: 'location_id', type: 'text' })
   locationId!: string
