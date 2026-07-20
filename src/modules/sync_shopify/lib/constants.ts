@@ -46,11 +46,14 @@ export const MAPPING_ENTITY_TYPE = {
 } as const
 
 // ── DOT dialect: CommandBus command ids ─────────────────────────────────────────────────────
+// All verified present in @open-mercato/core 0.6.6 by reading the registerCommand definitions.
 export const COMMAND = {
   productCreate: 'catalog.products.create',
   productUpdate: 'catalog.products.update',
+  productDelete: 'catalog.products.delete',
   variantCreate: 'catalog.variants.create',
   variantUpdate: 'catalog.variants.update',
+  variantDelete: 'catalog.variants.delete',
   priceCreate: 'catalog.prices.create',
   priceUpdate: 'catalog.prices.update',
   priceDelete: 'catalog.prices.delete',
@@ -59,6 +62,33 @@ export const COMMAND = {
   offerDelete: 'catalog.offers.delete',
   categoryCreate: 'catalog.categories.create',
   categoryUpdate: 'catalog.categories.update',
+  categoryDelete: 'catalog.categories.delete',
+  personCreate: 'customers.people.create',
+  personUpdate: 'customers.people.update',
+  personDelete: 'customers.people.delete',
+  addressCreate: 'customers.addresses.create',
+  addressUpdate: 'customers.addresses.update',
+  addressDelete: 'customers.addresses.delete',
+} as const
+
+/**
+ * The key each command returns its id under. **These are NOT uniform**, and the odd one out is
+ * genuinely surprising: `customers.people.*` returns `entityId`, not `personId` — because the row
+ * it creates is a `CustomerEntity`, with the person profile hanging off it.
+ *
+ * Reading the wrong key yields `undefined`, which then gets stored as an external-id mapping to
+ * nothing. Pass the right key to the writer's `resultKey` rather than guessing from the noun.
+ *
+ * Verified against the `CommandHandler<Input, Result>` generics in core 0.6.6.
+ */
+export const COMMAND_RESULT_KEY = {
+  product: 'productId',
+  variant: 'variantId',
+  price: 'priceId',
+  offer: 'offerId',
+  category: 'categoryId',
+  person: 'entityId',
+  address: 'addressId',
 } as const
 
 // ── Integration + provider identity ─────────────────────────────────────────────────────────
