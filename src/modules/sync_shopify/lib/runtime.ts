@@ -17,6 +17,7 @@ import type { ProductsMappingPort, ProductsRuntime } from './adapters/products'
 import type { CategoryAssignmentPort, CollectionsRunContext } from './adapters/collections'
 import type { CustomerSyncRuntime } from './adapters/customers'
 import type { InventorySnapshotStore } from './adapters/inventory'
+import type { OrderSyncRuntime, OrdersMappingPort } from './adapters/orders'
 
 /**
  * The convergence layer: builds each adapter's real dependencies from the framework container.
@@ -358,6 +359,98 @@ export async function createCustomersRuntime(
     // `contentHash` is deliberately left unset: there is no framework-provided home for a per-customer
     // hash yet, and a hash compared against a store that does not exist is worse than none (see the
     // adapter's port comment). Every resolved customer is rewritten instead of wrongly skipped.
+  }
+}
+
+// ── Orders ───────────────────────────────────────────────────────────────────────────────────────
+
+export async function createOrdersRuntime(
+  env: RuntimeEnv,
+  input: { scope: TenantScope; credentials: Record<string, unknown> },
+): Promise<OrderSyncRuntime> {
+  const { scope } = input
+  const client = createShopifyClientFromCredentials(input.credentials)
+  const run = await openRun(env)
+  const E = env.entities
+
+  const writer = createEntityWriter({
+    container: run.container,
+    scope,
+    integrationId: INTEGRATION_ID.orders,
+    commandBus: run.commandBus,
+    externalIdMapping: run.mappingService,
+    findOne: run.findOne,
+  })
+
+  const variantBySku = writer.naturalKeyLookup(E.variant, 'sku')
+  const mapping: OrdersMappingPort = run.mappingService
+
+  // `SalesOrder` is resolved from the container by name rather than imported: sales/di.ts registers it
+  // as an asValue, and importing `@open-mercato/core/modules/sales/data/entities` drags in the sales
+  // module's type graph, which currently fails typecheck (a latent `EventBus`-namespace-as-type bug in
+  // core's `sales/lib/types.ts`). Resolving by string is the akeneo pattern and sidesteps it entirely.
+  const salesOrder = run.container.resolve('SalesOrder') as unknown
+
+  return {
+    client,
+    writer,
+    mapping,
+    // `SalesOrder` has no deleted_at column — scope org + tenant only (as with CatalogProductPrice).
+    readOrder: (localId) => env.findOne(run.em, salesOrder, scoped(scope, { id: localId }), undefined, scope),
+    findOrderByExternalReference: (externalReference) => {
+      // A blank natural key would otherwise match an arbitrary row with a null external_reference.
+      if (typeof externalReference !== 'string' || externalReference.trim() === '') return Promise.resolve(null)
+      return env.findOne(run.em, salesOrder, scoped(scope, { externalReference }), undefined, scope)
+    },
+    // 🔴 TRAP 2: the variant was mapped by the PRODUCTS sync, so resolve its local id under
+    // `INTEGRATION_ID.products` — resolving under orders' own id would always miss. Fall back to the
+    // local variant's SKU (a natural key that heals a variant whose GID mapping is absent).
+    resolveVariantLocalId: async (variantExternalId, sku) => {
+      if (variantExternalId) {
+        const localId = await run.mappingService.lookupLocalId(
+          INTEGRATION_ID.products,
+          MAPPING_ENTITY_TYPE.productVariant,
+          variantExternalId,
+          scope,
+        )
+        if (localId) return localId
+      }
+      if (sku) {
+        const row = await variantBySku(sku)
+        if (row) return row.id
+      }
+      return null
+    },
+    // 🔴 TRAP 2: the customer was mapped by the CUSTOMERS sync — resolve under `INTEGRATION_ID.customers`.
+    resolveCustomerLocalId: (customerExternalId) =>
+      run.mappingService.lookupLocalId(
+        INTEGRATION_ID.customers,
+        MAPPING_ENTITY_TYPE.customerEntity,
+        customerExternalId,
+        scope,
+      ),
+    // ⚠️ NON-VOID, unlike products' `execute`. Orders dispatches child creates (payments, shipments)
+    // and needs their ids back (`paymentId`/`shipmentId`), so the bus envelope's `result` is returned
+    // rather than swallowed.
+    execute: async (commandId, commandInput) => ({
+      result: (await run.commandBus.execute(commandId, { input: commandInput, ctx: writer.commandContext })).result,
+    }),
+    listOwnedOrderIds: async () => {
+      const rows = await env.findMany(
+        run.em,
+        E.syncMapping,
+        scopedLive(scope, {
+          integrationId: INTEGRATION_ID.orders,
+          internalEntityType: MAPPING_ENTITY_TYPE.salesOrder,
+        }),
+        undefined,
+        scope,
+      )
+      return rows.map((row) => stringField(row.internalEntityId)).filter((id): id is string => id !== null)
+    },
+    // `resolveStatusEntryIds` is intentionally left unwired: it is optional, and absent it keeps the
+    // display statuses in `metadata.shopify` with the native payment_status/fulfillment_status columns
+    // null — the intended v1 behaviour, since no status dictionary is seeded yet.
   }
 }
 

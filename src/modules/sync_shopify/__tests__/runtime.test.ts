@@ -2,6 +2,7 @@ import {
   createCollectionsRunContext,
   createCustomersRuntime,
   createInventoryPorts,
+  createOrdersRuntime,
   createProductsRuntime,
   createShopifyClientFromCredentials,
   type RuntimeEnv,
@@ -9,6 +10,7 @@ import {
 import { createShopifyProductsAdapter } from '../lib/adapters/products'
 import { createShopifyCollectionsAdapter } from '../lib/adapters/collections'
 import { createCustomersAdapter } from '../lib/adapters/customers'
+import { createOrdersAdapter } from '../lib/adapters/orders'
 import { createShopifyInventoryAdapter } from '../lib/adapters/inventory'
 import { DEFAULT_API_VERSION, INTEGRATION_ID, MAPPING_ENTITY_TYPE, PROVIDER_KEY } from '../lib/constants'
 import type { EntityRow } from '../lib/writer'
@@ -31,19 +33,26 @@ type LookupLocalIdCall = { integrationId: string; entityType: string; externalId
 type LookupExternalIdCall = { integrationId: string; entityType: string; localId: string }
 
 function makeEnv(
-  opts: { findManyResult?: (call: FindCall) => EntityRow[]; findOneResult?: (call: FindCall) => EntityRow | null } = {},
+  opts: {
+    findManyResult?: (call: FindCall) => EntityRow[]
+    findOneResult?: (call: FindCall) => EntityRow | null
+    lookupLocalIdResult?: (call: LookupLocalIdCall) => string | null
+    commandResult?: (commandId: string) => unknown
+  } = {},
 ) {
   const findOneCalls: FindCall[] = []
   const findManyCalls: FindCall[] = []
   const lookupLocalIdCalls: LookupLocalIdCall[] = []
   const lookupExternalIdCalls: LookupExternalIdCall[] = []
   const setCustomFieldsCalls: Array<{ dataEngine: unknown; args: Record<string, unknown> }> = []
+  const executeCalls: Array<{ commandId: string; input: unknown; ctx: unknown }> = []
   let containerCount = 0
 
   const service = {
     async lookupLocalId(integrationId: string, entityType: string, externalId: string) {
-      lookupLocalIdCalls.push({ integrationId, entityType, externalId })
-      return null
+      const call = { integrationId, entityType, externalId }
+      lookupLocalIdCalls.push(call)
+      return opts.lookupLocalIdResult ? opts.lookupLocalIdResult(call) : null
     },
     async lookupExternalId(integrationId: string, entityType: string, localId: string) {
       lookupExternalIdCalls.push({ integrationId, entityType, localId })
@@ -56,13 +65,21 @@ function makeEnv(
       return true
     },
   }
-  const commandBus = { async execute() { return { result: { productId: 'local-x' }, logEntry: null } } }
+  const commandBus = {
+    async execute(commandId: string, options: { input: unknown; ctx: unknown }) {
+      executeCalls.push({ commandId, input: options.input, ctx: options.ctx })
+      return { result: opts.commandResult ? opts.commandResult(commandId) : { productId: 'local-x' }, logEntry: null }
+    },
+  }
   const snapshotStore = { async findDailyRows() { return [] }, async upsertSnapshots() { return new Map() } }
   const cradle: Record<string, unknown> = {
     em: { marker: 'em' },
     commandBus,
     externalIdMappingService: service,
     dataEngine: { marker: 'dataEngine' },
+    // The orders runtime resolves the SalesOrder entity class from the container by name (it is not
+    // imported — see the note in runtime.ts). The stub returns the sentinel the reads assert on.
+    SalesOrder: 'SalesOrder',
   }
   const container = { resolve: (name: string) => cradle[name] }
 
@@ -105,6 +122,7 @@ function makeEnv(
     lookupLocalIdCalls,
     lookupExternalIdCalls,
     setCustomFieldsCalls,
+    executeCalls,
     getContainerCount: () => containerCount,
   }
 }
@@ -131,6 +149,9 @@ describe('adapter registration', () => {
     const customers = createCustomersAdapter({
       createRuntime: (input) => createCustomersRuntime(env, input),
     })
+    const orders = createOrdersAdapter({
+      createRuntime: (input) => createOrdersRuntime(env, input),
+    })
     const inventory = createShopifyInventoryAdapter({
       createClient: createShopifyClientFromCredentials,
       ...createInventoryPorts(env),
@@ -139,6 +160,7 @@ describe('adapter registration', () => {
     expect(products.providerKey).toBe(PROVIDER_KEY.products)
     expect(collections.providerKey).toBe(PROVIDER_KEY.collections)
     expect(customers.providerKey).toBe(PROVIDER_KEY.customers)
+    expect(orders.providerKey).toBe(PROVIDER_KEY.orders)
     expect(inventory.providerKey).toBe(PROVIDER_KEY.inventory)
   })
 })
@@ -322,6 +344,110 @@ describe('customers runtime', () => {
       tenantId: 'tenant-1',
       deletedAt: null,
     })
+  })
+})
+
+// ── Orders ───────────────────────────────────────────────────────────────────────────────────
+
+describe('orders runtime', () => {
+  const build = (h: ReturnType<typeof makeEnv>) =>
+    createOrdersRuntime(h.env, { scope: SCOPE, credentials: CREDENTIALS })
+
+  it('opens exactly one request container for the whole run and builds a client', async () => {
+    const h = makeEnv()
+    const runtime = await build(h)
+    expect(h.getContainerCount()).toBe(1)
+    expect(runtime.client.shopDomain).toMatch(/myshopify\.com$/)
+  })
+
+  it('resolves a line variant under the PRODUCTS integration id, then falls back to SKU (trap 2)', async () => {
+    // Mapping hit: the variant GID resolves under products, so no SKU fallback is needed.
+    const hit = makeEnv({ lookupLocalIdResult: () => 'variant-local-1' })
+    const runtimeHit = await build(hit)
+    expect(await runtimeHit.resolveVariantLocalId('gid://shopify/ProductVariant/9', 'SKU-9')).toBe('variant-local-1')
+    const mappingCall = last(hit.lookupLocalIdCalls)
+    expect(mappingCall.integrationId).toBe(INTEGRATION_ID.products)
+    expect(mappingCall.integrationId).not.toBe(INTEGRATION_ID.orders)
+    expect(mappingCall.entityType).toBe(MAPPING_ENTITY_TYPE.productVariant)
+
+    // Mapping miss: falls back to a scoped SKU lookup on the variant (deletedAt IS present there).
+    const miss = makeEnv({ findOneResult: () => ({ id: 'variant-by-sku' }) })
+    const runtimeMiss = await build(miss)
+    expect(await runtimeMiss.resolveVariantLocalId('gid://shopify/ProductVariant/9', 'SKU-9')).toBe('variant-by-sku')
+    expect(last(miss.findOneCalls).entity).toBe('CatalogProductVariant')
+    expect(last(miss.findOneCalls).where).toEqual({
+      sku: 'SKU-9',
+      organizationId: 'org-1',
+      tenantId: 'tenant-1',
+      deletedAt: null,
+    })
+  })
+
+  it('resolves the order customer under the CUSTOMERS integration id (trap 2)', async () => {
+    const h = makeEnv()
+    const runtime = await build(h)
+    await runtime.resolveCustomerLocalId('gid://shopify/Customer/1')
+    const call = last(h.lookupLocalIdCalls)
+    expect(call.integrationId).toBe(INTEGRATION_ID.customers)
+    expect(call.integrationId).not.toBe(INTEGRATION_ID.orders)
+    expect(call.entityType).toBe(MAPPING_ENTITY_TYPE.customerEntity)
+  })
+
+  it('execute returns the bus result (NOT void), so a child create can read its id back', async () => {
+    const h = makeEnv({ commandResult: () => ({ paymentId: 'pay-1' }) })
+    const runtime = await build(h)
+    const outcome = await runtime.execute('sales.payments.create', { orderId: 'order-1' })
+    // The wrinkle: products' execute is void; orders must hand back the command result.
+    expect(outcome).toEqual({ result: { paymentId: 'pay-1' } })
+    const call = last(h.executeCalls)
+    expect(call.commandId).toBe('sales.payments.create')
+    expect(call.input).toEqual({ orderId: 'order-1' })
+    expect(call.ctx).toBe(runtime.writer.commandContext)
+  })
+
+  it('reads an order without a deletedAt filter — SalesOrder has no such column', async () => {
+    const h = makeEnv()
+    const runtime = await build(h)
+    await runtime.readOrder('order-1')
+    const byId = last(h.findOneCalls)
+    expect(byId.entity).toBe('SalesOrder')
+    expect(byId.where).toEqual({ id: 'order-1', organizationId: 'org-1', tenantId: 'tenant-1' })
+    expect('deletedAt' in byId.where).toBe(false)
+
+    await runtime.findOrderByExternalReference('gid://shopify/Order/1')
+    const byRef = last(h.findOneCalls)
+    expect(byRef.where).toEqual({
+      externalReference: 'gid://shopify/Order/1',
+      organizationId: 'org-1',
+      tenantId: 'tenant-1',
+    })
+    expect('deletedAt' in byRef.where).toBe(false)
+    // A blank natural key must never hit the database and match a null-external_reference row.
+    expect(await runtime.findOrderByExternalReference('  ')).toBeNull()
+  })
+
+  it('lists owned order ids from the mapping table under the orders integration', async () => {
+    const h = makeEnv({
+      findManyResult: () => [{ id: 'm', internalEntityId: 'order-1', externalId: 'gid://shopify/Order/1' }],
+    })
+    const runtime = await build(h)
+    const ids = await runtime.listOwnedOrderIds()
+    expect(ids).toEqual(['order-1'])
+    const call = last(h.findManyCalls)
+    expect(call.entity).toBe('SyncExternalIdMapping')
+    expect(call.where).toEqual({
+      integrationId: INTEGRATION_ID.orders,
+      internalEntityType: MAPPING_ENTITY_TYPE.salesOrder,
+      organizationId: 'org-1',
+      tenantId: 'tenant-1',
+      deletedAt: null,
+    })
+  })
+
+  it('leaves resolveStatusEntryIds unwired (native status columns stay null in v1)', async () => {
+    const h = makeEnv()
+    const runtime = await build(h)
+    expect(runtime.resolveStatusEntryIds).toBeUndefined()
   })
 })
 

@@ -15,6 +15,9 @@ import {
   CatalogProductVariant,
 } from '@open-mercato/core/modules/catalog/data/entities'
 import { CustomerAddress, CustomerEntity } from '@open-mercato/core/modules/customers/data/entities'
+// NOTE: `SalesOrder` is deliberately NOT imported here. It is DI-registered by sales/di.ts, and the
+// orders runtime resolves it from the container by name — importing the sales entities barrel drags in
+// core's `sales/lib/types.ts`, which currently fails typecheck (an `EventBus`-namespace-as-type bug).
 import { SyncExternalIdMapping } from '@open-mercato/core/modules/integrations/data/entities'
 import { HEALTH_CHECK_SERVICE } from './lib/constants'
 import { shopifyHealthCheck } from './lib/health'
@@ -22,11 +25,13 @@ import { createInventorySnapshotStore } from './lib/inventory-store'
 import { createShopifyProductsAdapter } from './lib/adapters/products'
 import { createShopifyCollectionsAdapter } from './lib/adapters/collections'
 import { createCustomersAdapter } from './lib/adapters/customers'
+import { createOrdersAdapter } from './lib/adapters/orders'
 import { createShopifyInventoryAdapter } from './lib/adapters/inventory'
 import {
   createCollectionsRunContext,
   createCustomersRuntime,
   createInventoryPorts,
+  createOrdersRuntime,
   createProductsRuntime,
   createShopifyClientFromCredentials,
   type RuntimeEnv,
@@ -105,6 +110,13 @@ export function register(container: AppContainer) {
     createCustomersAdapter({
       // Customers' runtime builds its own client — the adapter carries no separate `createClient`.
       createRuntime: (input) => createCustomersRuntime(env, input),
+    }),
+  )
+
+  registerDataSyncAdapter(
+    createOrdersAdapter({
+      // Orders' runtime builds its own client too; `OrdersAdapterOptions` has no `createClient`.
+      createRuntime: (input) => createOrdersRuntime(env, input),
     }),
   )
 
