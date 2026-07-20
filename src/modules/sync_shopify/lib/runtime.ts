@@ -332,6 +332,11 @@ export async function createCustomersRuntime(
     // ManyToOne to CustomerEntity; MikroORM accepts the parent id string as the filter value.)
     listAddresses: (customerLocalId) =>
       env.findMany(run.em, E.customerAddress, scoped(scope, { entity: customerLocalId }), undefined, scope),
+    // Same reason, single row: the address upsert's mapping re-validation re-reads by id. Must NOT
+    // use `writer.rowReader` (it forces deletedAt:null) — a mapped address on the second sync would
+    // throw on the missing column and fail the customer. Org + tenant only, mirroring listAddresses.
+    readAddressById: (localId) =>
+      env.findOne(run.em, E.customerAddress, scoped(scope, { id: localId }), undefined, scope),
     // Bound to this integration's own id — customers owns its customer and address mappings.
     lookupExternalId: (entityType, localId) =>
       run.mappingService.lookupExternalId(INTEGRATION_ID.customers, entityType, localId, scope),

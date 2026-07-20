@@ -84,14 +84,30 @@ export type CustomerSyncRuntime = {
   writer: EntityWriter
   /** Needed for address deletion — the writer only creates and updates. */
   commandBus: CommandBusPort
-  /** `CustomerEntity` class, for the writer's scoped id reads. */
+  /** `CustomerEntity` class, for the writer's scoped id reads — it HAS a `deleted_at` column. */
   customerEntity: unknown
-  /** `CustomerAddress` class, same. */
+  /**
+   * `CustomerAddress` class.
+   *
+   * ⚠️ NOT usable with `writer.rowReader`: that always appends `deletedAt: null`, and
+   * `customer_addresses` has **no `deleted_at` column** (core hard-deletes addresses via
+   * `em.remove`), so such a read throws under MikroORM v7. Address re-reads go through
+   * `readAddressById` instead. Kept because the constraint is easy to reintroduce and the harness
+   * models the throw against this class to keep the regression test honest.
+   */
   customerAddress: unknown
   /** Natural-key fallback: resolve a customer by `primaryEmail` when no mapping exists yet. */
   findCustomerByEmail(email: string): Promise<EntityRow | null>
-  /** Live addresses belonging to one customer. Scoped read — org + tenant + `deletedAt: null`. */
+  /** Live addresses belonging to one customer. Scoped org + tenant ONLY — no `deleted_at` column. */
   listAddresses(customerLocalId: string): Promise<EntityRow[]>
+  /**
+   * Re-read one address by local id for the upsert's mapping re-validation. Scoped org + tenant
+   * ONLY — `customer_addresses` has no `deleted_at`, so this MUST NOT go through `writer.rowReader`
+   * (which forces `deletedAt: null`). Getting this wrong is invisible on a first import — an unmapped
+   * address takes the create path and never re-reads — and only bites on the SECOND sync, where an
+   * already-mapped address is re-read, throws, and flips the whole customer to `failed`.
+   */
+  readAddressById(localId: string): Promise<EntityRow | null>
   /**
    * Reverse mapping lookup (`externalIdMappingService.lookupExternalId`).
    *
@@ -448,7 +464,10 @@ async function syncAddresses(
       createCommand: COMMAND.addressCreate,
       updateCommand: COMMAND.addressUpdate,
       resultKey: COMMAND_RESULT_KEY.address,
-      readById: runtime.writer.rowReader(runtime.customerAddress),
+      // NOT `writer.rowReader(customerAddress)`: that forces `deletedAt: null`, which
+      // `customer_addresses` has no column for — the re-read would throw on the second sync of a
+      // mapped address and fail the whole customer. See `CustomerSyncRuntime.readAddressById`.
+      readById: runtime.readAddressById,
       buildCreateInput: () => ({ ...addressInput(address, scope), entityId: customerLocalId }),
       // No hash short-circuit: an address is small, and its parent has already been established as
       // changed by the customer-level hash before this runs.

@@ -128,7 +128,13 @@ function makeHarness(options: HarnessOptions = {}) {
     },
   }
 
-  const findOne: FindOnePort = async (_entityName, where) => {
+  const findOne: FindOnePort = async (entityName, where) => {
+    // Model production faithfully: `customer_addresses` has NO `deleted_at` column, so a read that
+    // filters on it throws under MikroORM v7. This is what makes the second-sync regression real —
+    // the buggy `writer.rowReader(customerAddress)` path forces `deletedAt: null` and lands here.
+    if (entityName === 'CustomerAddress' && 'deletedAt' in where) {
+      throw new Error('[test] column "deleted_at" does not exist on customer_addresses')
+    }
     if (where.deletedAt !== null) return null
     if (typeof where.id === 'string') return rows.get(where.id) ?? null
     if (typeof where.primaryEmail === 'string') {
@@ -162,6 +168,9 @@ function makeHarness(options: HarnessOptions = {}) {
     customerAddress: 'CustomerAddress',
     findCustomerByEmail: async (email) => findOne('CustomerEntity', { primaryEmail: email, deletedAt: null }, undefined, SCOPE),
     listAddresses: async (customerLocalId) => addresses.get(customerLocalId) ?? [],
+    // Org + tenant only — no `deletedAt`, mirroring runtime.ts. A read straight from the row store,
+    // NOT through the `deletedAt`-forcing `findOne` above, which is exactly the point of the fix.
+    readAddressById: async (localId) => rows.get(localId) ?? null,
     lookupExternalId: async (entityType, localId) => options.owned?.[`${entityType}::${localId}`] ?? null,
     listSyncedCustomers: async () => options.syncedCustomers ?? [],
     ...(hashes
@@ -455,6 +464,28 @@ describe('per-customer address reconciliation', () => {
         { id: 'gid://shopify/MailingAddress/2', address1: '8 Hill Road', city: 'Bristol' },
       ],
     },
+  })
+
+  it('updates an already-mapped address on the SECOND sync instead of failing the customer', async () => {
+    // The second-sync trap. An already-mapped address is re-read before its update. That re-read
+    // must NOT force `deletedAt: null` — `customer_addresses` has no such column and the query
+    // throws, flipping the whole customer to `failed`. First import hides it (unmapped → create
+    // path, never re-reads); the bug only surfaces on run two. The harness models the missing column
+    // (a CustomerAddress read carrying `deletedAt` throws), so this test fails against the buggy
+    // `writer.rowReader(customerAddress)` wiring and passes only with `readAddressById`.
+    const harness = makeHarness()
+    await runAdapter(harness, [customerNode()])
+    expect(harness.addresses.get('cust-1')).toHaveLength(1)
+
+    // Run again with the customer and address already mapped from run one.
+    const batches = await runAdapter(harness, [customerNode()])
+    const items = batches.flatMap((batch) => batch.items) as { action: string; data: Record<string, unknown> }[]
+
+    expect(items[0].action).not.toBe('failed')
+    expect(items[0].action).toBe('update')
+    // The address took the update branch — a re-read that threw would have prevented this and there
+    // would be an addressCreate-then-fail instead.
+    expect(harness.commandCalls.filter((call) => call.commandId === COMMAND.addressUpdate).length).toBeGreaterThan(0)
   })
 
   it('removes an address deleted upstream, and leaves its sibling and the customer intact', async () => {
