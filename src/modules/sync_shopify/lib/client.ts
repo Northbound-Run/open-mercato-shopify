@@ -61,10 +61,30 @@ export class ShopifyApiError extends Error {
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
+/** A response with its `extensions` envelope intact. See `requestDetailed`. */
+export type DetailedResponse<TData> = {
+  data: TData
+  extensions: Record<string, unknown> | undefined
+}
+
 export type ShopifyClient = {
   readonly shopDomain: string
   readonly apiVersion: string
   request<TData = unknown>(query: string, options?: GraphQLRequestOptions): Promise<TData>
+  /**
+   * Same request, but returns `extensions` alongside the data.
+   *
+   * Needed because Shopify reports a **silently ignored search filter** in
+   * `extensions.search[].warnings` rather than as an error — and per R-13, an invalid field means
+   * "the query is ignored and all results are returned". A delta sync with a typo'd `updated_at`
+   * therefore degrades into a full scan that still returns correct-looking data. Callers doing
+   * filtered queries should send `Shopify-Search-Query-Debug: 1` and assert those warnings are
+   * empty; `request` alone discards the only evidence that anything went wrong.
+   */
+  requestDetailed<TData = unknown>(
+    query: string,
+    options?: GraphQLRequestOptions,
+  ): Promise<DetailedResponse<TData>>
   /** Last observed bucket state — for surfacing pacing in run telemetry. */
   readonly cost: CostTracker
 }
@@ -109,10 +129,10 @@ export function createShopifyClient(options: ShopifyClientOptions): ShopifyClien
     return client
   }
 
-  async function request<TData = unknown>(
+  async function requestDetailed<TData = unknown>(
     query: string,
     requestOptions: GraphQLRequestOptions = {},
-  ): Promise<TData> {
+  ): Promise<DetailedResponse<TData>> {
     const { variables, estimatedCost, signal } = requestOptions
     let lastCost: QueryCost | null = null
     let tokenRetried = false
@@ -176,11 +196,21 @@ export function createShopifyClient(options: ShopifyClientOptions): ShopifyClien
         throw new ShopifyApiError('empty_response', '[internal] Shopify returned no data and no errors')
       }
 
-      return response.data
+      // `extensions` travels back with the data: it carries the cost envelope and, for filtered
+      // queries, `search[].warnings` — the only signal that Shopify ignored a filter and quietly
+      // returned everything (R-13).
+      return { data: response.data, extensions: response.extensions }
     }
 
     throw new ShopifyApiError('throttled', '[internal] exhausted retries', true)
   }
 
-  return { shopDomain, apiVersion, request, cost: tracker }
+  async function request<TData = unknown>(
+    query: string,
+    requestOptions: GraphQLRequestOptions = {},
+  ): Promise<TData> {
+    return (await requestDetailed<TData>(query, requestOptions)).data
+  }
+
+  return { shopDomain, apiVersion, request, requestDetailed, cost: tracker }
 }

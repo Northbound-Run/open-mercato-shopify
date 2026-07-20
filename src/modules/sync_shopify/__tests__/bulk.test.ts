@@ -46,6 +46,14 @@ function stubClient(responses: unknown[] | ((index: number) => unknown)) {
       calls.push({ query, variables: options?.variables, estimatedCost: options?.estimatedCost })
       return pick(calls.length - 1) as TData
     },
+    async requestDetailed<TData>(
+      query: string,
+      options?: { variables?: Record<string, unknown>; estimatedCost?: number },
+    ) {
+      // Bulk operations take no search filter, so there are no search warnings to surface here.
+      calls.push({ query, variables: options?.variables, estimatedCost: options?.estimatedCost })
+      return { data: pick(calls.length - 1) as TData, extensions: undefined }
+    },
   }
   return { client, calls }
 }
