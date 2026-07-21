@@ -29,6 +29,7 @@ import {
 } from '../constants'
 import { toImportItem, type CommandBusPort, type EntityWriter, type ExternalIdMappingPort } from '../writer'
 import { mapCollection, mapCollectionProductIds, type MappedCollection } from '../mappers/collection'
+import { heartbeatBatch, heartbeatWhile, type HeartbeatClock } from '../heartbeat'
 
 /**
  * Shopify Collections → `catalog_product_categories` + `catalog_product_category_assignments`.
@@ -315,6 +316,14 @@ export type CollectionsAdapterDeps = {
   createRunContext: (input: { scope: TenantScope }) => Promise<CollectionsRunContext>
   /** Test seam for bulk polling/downloading. Defaults to the real HTTP path. */
   bulkOptions?: BulkExportOptions
+  /**
+   * Beat cadence for the bulk-poll liveness heartbeat. Defaults to `DEFAULT_HEARTBEAT_INTERVAL_MS`.
+   * Production omits it; tests set it small. (There is no reconcile sweep here — removals are
+   * interleaved per collection inside `syncMembership` — so no `now`/reconcile clock is needed.)
+   */
+  heartbeatIntervalMs?: number
+  /** Injectable timer for the bulk-poll heartbeat; defaults to real `setTimeout`. Tests only. */
+  heartbeatClock?: HeartbeatClock
 }
 
 // ── Internal shapes ──────────────────────────────────────────────────────────────────────────
@@ -821,7 +830,6 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
     const batchOptions = { allowRemovals, scope: input.scope }
     const batchSize = Math.max(1, input.batchSize || COLLECTION_PAGE_SIZE)
     let batchIndex = 0
-    let processedCount = 0
     let unmappedProducts = 0
 
     /** Emit whatever has accumulated, and roll the cursor forward with it. */
@@ -831,13 +839,15 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
       extra: { message?: string } = {},
     ): ImportBatch {
       state = advanceCursor(state, advance)
-      processedCount += items.length
       const batch: ImportBatch = {
         items,
         cursor: serializeCursor(state),
         hasMore: Boolean(advance.next),
         batchIndex: batchIndex++,
-        processedCount,
+        // Per-batch delta (matching products.ts), NOT a running cumulative: the engine SUMS
+        // processedCount across batches, so a cumulative here triangular-inflates the total. The
+        // empty bulk-poll heartbeats carry no items, so they add 0 to that sum.
+        processedCount: items.length,
         ...(extra.message ? { message: extra.message } : {}),
       }
       return batch
@@ -861,6 +871,11 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
       // ── Backfill ─────────────────────────────────────────────────────────────────────────
       const anomalies: BulkAnomaly[] = []
       let anomalyCount = 0
+      // The bulk export blocks on a poll loop (up to an hour) that yields nothing. Stash the live
+      // operation via `onPoll` and beat while it runs, so the job's heartbeat stays fresh past the
+      // 60s watchdog and the run log shows scan progress — object counts only, never catalog data.
+      let lastOp: BulkOperation | null = null
+      const existingOnPoll = deps.bulkOptions?.onPoll
       const options: BulkExportOptions = {
         ...deps.bulkOptions,
         onAnomaly: (anomaly) => {
@@ -870,9 +885,29 @@ export function createShopifyCollectionsAdapter(deps: CollectionsAdapterDeps): D
           anomalyCount += 1
           if (anomalies.length < MAX_REPORTED_ANOMALIES) anomalies.push(anomaly)
         },
+        // Composed with any onPoll already on `deps.bulkOptions`, so the seam a caller wired for its
+        // own telemetry keeps firing alongside the heartbeat's operation stash.
+        onPoll: (op) => {
+          lastOp = op
+          existingOnPoll?.(op)
+        },
       }
 
-      const stream = await openBulkStream(client, { resumeOperationId: resumeBulkId, options })
+      // Race the export against the heartbeat timer: beat every interval until `openBulkStream`
+      // settles, then re-await it for the value/throw. The heartbeat's `batchIndex++` shares
+      // `toBatch`'s counter, so indices stay monotonic across beats and data batches alike.
+      const streamPromise = openBulkStream(client, { resumeOperationId: resumeBulkId, options })
+      yield* heartbeatWhile(
+        streamPromise,
+        () =>
+          heartbeatBatch({
+            cursor: serializeCursor(state ?? { kind: 'idle', updatedAfter: null }),
+            batchIndex: batchIndex++,
+            message: `Exporting Shopify collections… ${lastOp?.objectCount ?? 0} rows scanned`,
+          }),
+        { intervalMs: deps.heartbeatIntervalMs, clock: deps.heartbeatClock },
+      )
+      const stream = await streamPromise
       const bulkOperationId = stream.operation.id
       let items: ImportItem[] = []
       let maxUpdatedAt: string | null = null

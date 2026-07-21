@@ -1,7 +1,7 @@
 import type { ImportBatch, StreamImportInput } from '@open-mercato/core/modules/data_sync/lib/adapter'
 import type { BulkExport, BulkNode } from '../lib/bulk'
 import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../lib/client'
-import { COMMAND, COMMAND_RESULT_KEY, ENTITY_TYPE, MAPPING_ENTITY_TYPE, PROVIDER_KEY } from '../lib/constants'
+import { COMMAND, COMMAND_RESULT_KEY, ENTITY_TYPE, MAPPING_ENTITY_TYPE, OM_ENTITY_ID, PROVIDER_KEY } from '../lib/constants'
 import { parseCursor, serializeCursor } from '../lib/cursor'
 import { createEntityWriter, type CommandBusPort, type EntityRow, type FindOnePort } from '../lib/writer'
 import {
@@ -10,6 +10,7 @@ import {
   buildUpdatedAtFilter,
   bulkNodeToCustomer,
   buildCustomerBulkQuery,
+  classifyWriteFailure,
   createCustomersAdapter,
   CustomersSyncError,
   readSearchWarnings,
@@ -17,6 +18,7 @@ import {
   type CustomerSyncRuntime,
 } from '../lib/adapters/customers'
 import type { ShopifyCustomerNode } from '../lib/mappers/customer'
+import type { HeartbeatClock } from '../lib/heartbeat'
 
 // The whole framework is stubbed, but the WRITER IS REAL: the `customers.people.*` result-key trap
 // (`entityId`, not `personId`) only exists inside the writer's unwrapping, so stubbing it away
@@ -71,6 +73,12 @@ function toBulkNode(node: ShopifyCustomerNode): BulkNode {
 type HarnessOptions = {
   /** Throw from the command bus for a chosen call, to exercise the per-item failure path. */
   failCommand?: (call: CommandCall) => boolean
+  /**
+   * When set, its return value (if not undefined) is thrown for a chosen call instead of the
+   * default plain Error — used to feed the real error SHAPES (ZodError, driver exceptions) whose
+   * classification the failure path must surface without leaking their message.
+   */
+  failCommandError?: (call: CommandCall) => unknown
   /** Local addresses already present, keyed by customer local id. */
   existingAddresses?: Record<string, EntityRow[]>
   /** Reverse-mapping answers: `${entityType}::${localId}` → external id. Absent means NOT owned. */
@@ -96,6 +104,8 @@ function makeHarness(options: HarnessOptions = {}) {
       const call = { commandId, input }
       commandCalls.push(call)
       if (options.failCommand?.(call)) {
+        const custom = options.failCommandError?.(call)
+        if (custom !== undefined) throw custom
         // Zod quotes the value it rejected, which is exactly the PII shape that must not survive
         // into an item's errorMessage — so the stub throws one.
         throw new Error(`Invalid primaryEmail: received "${String(input.primaryEmail ?? '')}"`)
@@ -222,6 +232,176 @@ async function collect(iterable: AsyncIterable<ImportBatch>): Promise<ImportBatc
   for await (const batch of iterable) batches.push(batch)
   return batches
 }
+
+// ── Heartbeat test doubles ──────────────────────────────────────────────────────────────────
+
+/** A promise whose settlement the test controls, for holding the bulk export open mid-run. */
+function makeDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+/** A `HeartbeatClock` whose bulk-poll timers fire only when the test says so. */
+function makeFakeHeartbeatClock() {
+  type Timer = { cb: () => void; dead: boolean }
+  const timers: Timer[] = []
+  const clock: HeartbeatClock = {
+    setTimer: (_ms, cb) => {
+      const timer: Timer = { cb, dead: false }
+      timers.push(timer)
+      return () => {
+        timer.dead = true
+      }
+    },
+  }
+  return {
+    clock,
+    /** Fire the most recent live timer, mimicking one interval elapsing. */
+    fireNext(): boolean {
+      for (let i = timers.length - 1; i >= 0; i -= 1) {
+        if (!timers[i].dead) {
+          timers[i].dead = true
+          timers[i].cb()
+          return true
+        }
+      }
+      return false
+    },
+  }
+}
+
+/** Hop the macrotask boundary so the adapter generator reaches its next await/yield. */
+const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+async function drainBatches(iterator: AsyncIterator<ImportBatch>): Promise<ImportBatch[]> {
+  const out: ImportBatch[] = []
+  for (;;) {
+    const result = await iterator.next()
+    if (result.done) break
+    out.push(result.value)
+  }
+  return out
+}
+
+describe('liveness heartbeats', () => {
+  it('beats while the bulk export is still running, before the first data batch', async () => {
+    const harness = makeHarness()
+    const work = makeDeferred<BulkExport>()
+    const fake = makeFakeHeartbeatClock()
+    const adapter = createCustomersAdapter({
+      createRuntime: async () => harness.runtime,
+      // Held open until the test resolves it, so the poll phase is observably in progress.
+      bulkExport: () => work.promise,
+      heartbeatClock: fake.clock,
+    })
+
+    const iterator = adapter.streamImport!(importInput())[Symbol.asyncIterator]()
+
+    // First pull: the export has not resolved, so an empty heartbeat must arrive first.
+    const firstPull = iterator.next()
+    await flushAsync() // let the generator arm its heartbeat timer
+    expect(fake.fireNext()).toBe(true)
+    const beat = await firstPull
+
+    expect(beat.done).toBe(false)
+    expect(beat.value.items).toEqual([]) // empty — no created/updated/skipped/failed delta
+    expect('processedCount' in beat.value).toBe(false) // adds 0 to the engine total
+    // The heartbeat carried the pre-export cursor unchanged (nothing to resume into mid-poll).
+    expect(beat.value.cursor).toBe(serializeCursor({ kind: 'idle', updatedAfter: null }))
+
+    // Let the export finish; the remainder of the run carries the real customer. The stub ignores
+    // its arguments, but its type declares them, so pass the client + query through.
+    work.resolve(await bulkExportOf([toBulkNode(customerNode())])(harness.runtime.client, buildCustomerBulkQuery()))
+    const rest = await drainBatches(iterator)
+
+    const dataItems = rest.flatMap((b) => b.items) as { action: string; externalId: string }[]
+    expect(dataItems).toHaveLength(1)
+    expect(dataItems[0]).toMatchObject({ action: 'create', externalId: 'gid://shopify/Customer/1001' })
+  })
+
+  it('a fast-resolving bulk export yields NO heartbeat, so existing sequences are unchanged', async () => {
+    const harness = makeHarness()
+    const fake = makeFakeHeartbeatClock()
+    const batches = await collect(
+      createCustomersAdapter({
+        createRuntime: async () => harness.runtime,
+        bulkExport: bulkExportOf([toBulkNode(customerNode())]),
+        heartbeatClock: fake.clock,
+      }).streamImport!(importInput()),
+    )
+    // The stubbed export settles on a microtask — long before any interval — so the timer is
+    // cancelled unfired and no empty heartbeat batch enters the stream.
+    const heartbeats = batches.filter((b) => b.items.length === 0 && /rows scanned/.test(b.message ?? ''))
+    expect(heartbeats).toHaveLength(0)
+    expect(fake.fireNext()).toBe(false)
+  })
+
+  it('beats during the reconcile sweep, and still emits the terminal reconcile batch', async () => {
+    let clock = 0
+    const harness = makeHarness({
+      syncedCustomers: [
+        { localId: 'cust-a', externalId: 'gid://shopify/Customer/9001' },
+        { localId: 'cust-b', externalId: 'gid://shopify/Customer/9002' },
+        { localId: 'cust-c', externalId: 'gid://shopify/Customer/9003' },
+      ],
+      owned: {}, // none owned → all skipped, but the sweep still walks every id
+    })
+    const adapter = createCustomersAdapter({
+      createRuntime: async () => harness.runtime,
+      bulkExport: bulkExportOf([toBulkNode(customerNode())]),
+      heartbeatIntervalMs: 100,
+      // Advances well past the interval on every call, so each swept id is "due".
+      now: () => (clock += 1_000),
+    })
+
+    const batches = await collect(adapter.streamImport!(importInput()))
+
+    const reconcileBeats = batches.filter(
+      (b) => b.items.length === 0 && (b.message ?? '').includes('checked'),
+    )
+    expect(reconcileBeats.length).toBeGreaterThanOrEqual(1)
+    reconcileBeats.forEach((b) => expect('processedCount' in b).toBe(false))
+
+    const last = batches[batches.length - 1]
+    expect(last.hasMore).toBe(false)
+    expect(last.message).toBe('Reconciling Shopify customers after the final batch')
+    expect(last.refreshCoverageEntityTypes).toEqual([OM_ENTITY_ID.customerEntity])
+  })
+
+  it('reports processedCount as a per-batch delta that sums to the true customer count', async () => {
+    const harness = makeHarness()
+    const nodes = [1, 2, 3, 4, 5].map((n) =>
+      customerNode({
+        id: `gid://shopify/Customer/${n}`,
+        defaultEmailAddress: { emailAddress: `c${n}@example.com` },
+        defaultAddress: { id: `gid://shopify/MailingAddress/${n}` },
+        addressesV2: { nodes: [{ id: `gid://shopify/MailingAddress/${n}`, address1: STREET, city: 'London' }] },
+      }),
+    )
+
+    // batchSize 2 over 5 customers → the backfill emits data batches of 2, 2, then 1.
+    const batches = await collect(
+      createCustomersAdapter({
+        createRuntime: async () => harness.runtime,
+        bulkExport: bulkExportOf(nodes.map(toBulkNode)),
+      }).streamImport!(importInput({ batchSize: 2 })),
+    )
+
+    // The engine SUMS processedCount across batches; a per-batch delta must total the real count
+    // exactly, with no triangular inflation from a running cumulative.
+    const totalProcessed = batches.reduce((sum, b) => sum + (b.processedCount ?? 0), 0)
+    expect(totalProcessed).toBe(5)
+
+    for (const b of batches) {
+      if (b.items.length > 0) expect(b.processedCount).toBe(b.items.length)
+    }
+  })
+})
 
 function runAdapter(
   harness: ReturnType<typeof makeHarness>,
@@ -624,6 +804,58 @@ describe('PII containment', () => {
     expect(message).not.toContain('Ada')
     expect(message).not.toContain('Lovelace')
     // It does identify the record, or the failure would be unactionable.
+    expect(message).toContain('gid://shopify/Customer/1001')
+  })
+
+  it('🔒 classifyWriteFailure surfaces a validator field and rule, never the rejected value', () => {
+    // The exact shape core's Zod throw takes: `issues[]`, each a field `path` + rule `code`, with a
+    // `message` that QUOTES the offending value. Only the path and code may survive.
+    const zodLike = {
+      name: 'ZodError',
+      message: `String must contain at most 150 character(s): received "${STREET}"`,
+      issues: [
+        { path: ['country'], code: 'too_big', maximum: 150, message: `too big "${STREET}"` },
+        { path: ['postalCode'], code: 'invalid_type', message: `expected string, got "${STREET}"` },
+      ],
+    }
+    const classified = classifyWriteFailure(zodLike)
+    expect(classified).toBe('validation country:too_big,postalCode:invalid_type')
+    expect(classified).not.toContain(STREET)
+  })
+
+  it('classifyWriteFailure labels a non-Zod error by class and code, not its message', () => {
+    class UniqueConstraintViolationException extends Error {
+      code = '23505'
+      constructor(msg: string) {
+        super(msg)
+        this.name = 'UniqueConstraintViolationException'
+      }
+    }
+    const classified = classifyWriteFailure(new UniqueConstraintViolationException(`Key (email)=(${EMAIL}) exists`))
+    expect(classified).toBe('UniqueConstraintViolationException code=23505')
+    expect(classified).not.toContain(EMAIL)
+  })
+
+  it('🔒 an address-write failure surfaces the failure shape but withholds the address', async () => {
+    // Reaches the address stage (person create succeeds), then the address write throws a Zod error
+    // whose message quotes the street. The item must name WHAT failed without the value.
+    const harness = makeHarness({
+      failCommand: (call) => call.commandId === COMMAND.addressCreate,
+      failCommandError: () => ({
+        name: 'ZodError',
+        message: `Invalid: received "${STREET}"`,
+        issues: [{ path: ['postalCode'], code: 'too_big', message: `too big "${STREET}"` }],
+      }),
+    })
+    const batches = await runAdapter(harness, [customerNode()])
+    const failed = (batches.flatMap((batch) => batch.items) as { action: string; data: Record<string, unknown> }[]).find(
+      (item) => item.action === 'failed',
+    )!
+    const message = String(failed.data.errorMessage)
+
+    expect(message).toContain('failed at address write')
+    expect(message).toContain('validation postalCode:too_big')
+    expect(message).not.toContain(STREET)
     expect(message).toContain('gid://shopify/Customer/1001')
   })
 

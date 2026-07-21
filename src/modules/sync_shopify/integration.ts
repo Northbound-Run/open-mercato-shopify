@@ -42,11 +42,16 @@ export const bundle: IntegrationBundle = {
     fields: [
       {
         key: 'shopDomain',
+        // Plain host, NOT `type: 'url'`: the framework validates url-typed fields with `new URL()`,
+        // which requires an `https://` scheme and would reject the bare `mystore.myshopify.com` we
+        // want. The real validation (bare/scheme/path tolerance, foreign-host rejection) lives in
+        // `normalizeShopDomain`, applied at seed time and when the client is built.
         label: 'Shop domain',
-        type: 'url',
+        type: 'text',
         required: true,
         placeholder: 'mystore.myshopify.com',
-        helpText: 'Your permanent .myshopify.com domain, not a custom storefront domain.',
+        helpText:
+          'Your permanent .myshopify.com domain (no https://), not a custom storefront domain.',
       },
       {
         key: 'clientId',

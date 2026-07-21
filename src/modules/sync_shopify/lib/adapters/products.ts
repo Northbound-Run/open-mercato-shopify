@@ -6,7 +6,13 @@ import type {
   TenantScope,
 } from '@open-mercato/core/modules/data_sync/lib/adapter'
 import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../client'
-import { childrenOfType, runBulkExport, type BulkExportOptions, type BulkNode } from '../bulk'
+import {
+  childrenOfType,
+  runBulkExport,
+  type BulkExportOptions,
+  type BulkNode,
+  type BulkOperation,
+} from '../bulk'
 import {
   advanceCursor,
   normalizeTimestamp,
@@ -45,6 +51,12 @@ import {
   type ShopifyProductNode,
   type ShopifyVariantNode,
 } from '../mappers/product'
+import {
+  heartbeatBatch,
+  heartbeatWhile,
+  makeReconcileHeartbeat,
+  type HeartbeatClock,
+} from '../heartbeat'
 
 /**
  * The Shopify products import adapter.
@@ -158,6 +170,15 @@ export type ProductsAdapterDeps = {
   }): Promise<ProductsRuntime> | ProductsRuntime
   /** Bulk polling knobs, injected so tests do not sleep. */
   bulkOptions?: BulkExportOptions
+  /**
+   * Beat cadence for the liveness heartbeats (bulk-poll and reconcile sweep). Defaults to
+   * `DEFAULT_HEARTBEAT_INTERVAL_MS` (15s). Production omits it; tests set it small.
+   */
+  heartbeatIntervalMs?: number
+  /** Injectable timer for the bulk-poll heartbeat; defaults to real `setTimeout`. Tests only. */
+  heartbeatClock?: HeartbeatClock
+  /** Injectable clock for the reconcile-sweep heartbeat gate; defaults to `Date.now`. Tests only. */
+  now?: () => number
 }
 
 // ── Tuning ───────────────────────────────────────────────────────────────────────────────────
@@ -622,15 +643,37 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
    *
    * Only ever called behind the `!input.cursor` guard. Products are deactivated rather than
    * deleted, per §4.8 — only prices and offers are removed outright.
+   *
+   * A catalog-sized sweep awaits one `upsert` per owned product and yields nothing while it runs,
+   * so it trips the 60s stale-job watchdog exactly like the bulk poll does. It therefore emits a
+   * time-gated liveness heartbeat (empty items, unchanged cursor) at the top of the loop. The
+   * deactivation items are collected and RETURNED, not yielded, so the caller can carry them on its
+   * terminal batch — the heartbeats add nothing to any tally.
    */
-  async function reconcileProducts(
+  async function* reconcileProducts(
     seenProductLocalIds: Set<string>,
     ctx: RunContext,
-  ): Promise<ImportItem[]> {
+    due: () => boolean,
+    cursor: string,
+    nextBatchIndex: () => number,
+  ): AsyncGenerator<ImportBatch, ImportItem[]> {
     const owned = await ctx.runtime.listOwnedLocalIds(MAPPING_ENTITY_TYPE.product)
     const items: ImportItem[] = []
+    let checked = 0
 
     for (const localId of owned) {
+      checked += 1
+      // Beat BEFORE the ownership branches, and time-gated, so the job stays alive during a long
+      // sweep regardless of how many products are skipped as already-seen or not-owned. The cursor
+      // is unchanged (nothing to resume mid-sweep) and no items ride along, so no tally moves.
+      if (due()) {
+        yield heartbeatBatch({
+          cursor,
+          batchIndex: nextBatchIndex(),
+          message: `Reconciling Shopify products… ${checked} checked`,
+        })
+      }
+
       if (seenProductLocalIds.has(localId)) continue
 
       const externalId = await ctx.runtime.mapping.lookupExternalId(
@@ -669,8 +712,21 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
 
   // ── Sources ────────────────────────────────────────────────────────────────────────────────
 
-  async function* bulkPages(client: ShopifyClient, batchSize: number): AsyncIterable<ProductPage> {
-    const result = await runBulkExport(client, PRODUCTS_BULK_QUERY, deps.bulkOptions ?? {})
+  async function* bulkPages(
+    client: ShopifyClient,
+    batchSize: number,
+    onPoll: (op: BulkOperation) => void,
+  ): AsyncIterable<ProductPage> {
+    const base = deps.bulkOptions ?? {}
+    const result = await runBulkExport(client, PRODUCTS_BULK_QUERY, {
+      ...base,
+      // Compose rather than replace: a caller may already watch polls, and the bulk-poll heartbeat
+      // (driven from `streamImport`) needs the live operation to report scan progress.
+      onPoll: (op) => {
+        base.onPoll?.(op)
+        onPoll(op)
+      },
+    })
     const pointer: CursorPointer = { kind: 'bulk', bulkOperationId: result.operation.id }
 
     if (!result.nodes) {
@@ -790,6 +846,7 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
     client: ShopifyClient,
     state: ShopifyCursorState | null,
     batchSize: number,
+    onPoll: (op: BulkOperation) => void,
   ): AsyncIterable<ProductPage> {
     if (state?.kind === 'paging' && state.updatedAfter) {
       return deltaPages(client, { updatedAfter: state.updatedAfter, after: state.endCursor })
@@ -797,7 +854,7 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
     if (state?.kind === 'idle' && state.updatedAfter) {
       return deltaPages(client, { updatedAfter: state.updatedAfter, after: null })
     }
-    return bulkPages(client, batchSize)
+    return bulkPages(client, batchSize, onPoll)
   }
 
   function latestUpdatedAt(nodes: ShopifyProductNode[]): string | null {
@@ -866,7 +923,32 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
       const seenProductLocalIds = new Set<string>()
       const batchSize = input.batchSize > 0 ? input.batchSize : DELTA_PRODUCT_PAGE_SIZE
 
-      for await (const page of chooseSource(client, state, batchSize)) {
+      // The bulk backfill blocks the FIRST source pull on a poll loop (up to an hour) that yields
+      // nothing, tripping the 60s stale-job watchdog. Stash the live operation via `onPoll` and beat
+      // while that first pull is in flight, so the job's heartbeat stays fresh and the run log shows
+      // scan progress — object counts only, never a record's contents. The iterator is driven by
+      // hand purely so the first `next()` (which is what triggers the poll) can be wrapped; every
+      // pull after it just drains the already-downloaded buffer. The delta path resolves its first
+      // request long before a beat is due, so its behaviour is unchanged.
+      let lastOp: BulkOperation | null = null
+      const iterator = chooseSource(client, state, batchSize, (op) => {
+        lastOp = op
+      })[Symbol.asyncIterator]()
+
+      const firstPage = iterator.next()
+      yield* heartbeatWhile(
+        firstPage,
+        () =>
+          heartbeatBatch({
+            cursor: serializeCursor(state),
+            batchIndex: batchIndex++,
+            message: `Exporting Shopify products… ${lastOp?.objectCount ?? 0} rows scanned`,
+          }),
+        { intervalMs: deps.heartbeatIntervalMs, clock: deps.heartbeatClock },
+      )
+
+      for (let result = await firstPage; !result.done; result = await iterator.next()) {
+        const page = result.value
         const items: ImportItem[] = []
         for (const node of page.nodes) {
           items.push(...(await importProduct(node, ctx, seenProductLocalIds)))
@@ -890,9 +972,17 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
       if (!fullSync) return
 
       // 🔴 Everything below is reachable ONLY on a full run. A delta sees just the changed
-      // records, so reconciling one would deactivate the entire catalog.
+      // records, so reconciling one would deactivate the entire catalog. The sweep yields its own
+      // liveness heartbeats and RETURNS the deactivation items, which ride the terminal batch.
+      const reconciled = yield* reconcileProducts(
+        seenProductLocalIds,
+        ctx,
+        makeReconcileHeartbeat({ intervalMs: deps.heartbeatIntervalMs, now: deps.now }),
+        serializeCursor(state),
+        () => batchIndex++,
+      )
       yield {
-        items: await reconcileProducts(seenProductLocalIds, ctx),
+        items: reconciled,
         cursor: serializeCursor(state),
         hasMore: false,
         batchIndex: batchIndex++,

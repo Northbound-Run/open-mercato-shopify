@@ -7,7 +7,7 @@ import type {
   TenantScope,
 } from '@open-mercato/core/modules/data_sync/lib/adapter'
 import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../client'
-import type { BulkExport, BulkNode } from '../bulk'
+import type { BulkExport, BulkExportOptions, BulkNode, BulkOperation } from '../bulk'
 import { childrenOfType, runBulkExport } from '../bulk'
 import {
   COMMAND,
@@ -34,6 +34,12 @@ import {
   type ShopifyCustomerNode,
   type ShopifyMailingAddress,
 } from '../mappers/customer'
+import {
+  heartbeatBatch,
+  heartbeatWhile,
+  makeReconcileHeartbeat,
+  type HeartbeatClock,
+} from '../heartbeat'
 
 /**
  * The Shopify customers import adapter.
@@ -158,9 +164,20 @@ export type CustomersAdapterOptions = {
    *
    * Overridden in tests so the backfill path — which is where full-sync reconciliation lives, and
    * therefore the most consequential branch in this file — can be exercised without standing up
-   * mutation, polling and a signed JSONL download.
+   * mutation, polling and a signed JSONL download. Accepts the real `BulkExportOptions` so the
+   * bulk-poll heartbeat can compose an `onPoll` callback onto it; the existing 2-arg test stubs
+   * remain assignable.
    */
-  bulkExport?: (client: ShopifyClient, query: string) => Promise<BulkExport>
+  bulkExport?: (client: ShopifyClient, query: string, options?: BulkExportOptions) => Promise<BulkExport>
+  /**
+   * Beat cadence for the liveness heartbeats (bulk-poll and reconcile sweep). Defaults to
+   * `DEFAULT_HEARTBEAT_INTERVAL_MS`. Production omits it; tests set it small.
+   */
+  heartbeatIntervalMs?: number
+  /** Injectable timer for the bulk-poll heartbeat; defaults to real `setTimeout`. Tests only. */
+  heartbeatClock?: HeartbeatClock
+  /** Injectable clock for the reconcile-sweep heartbeat gate; defaults to `Date.now`. Tests only. */
+  now?: () => number
 }
 
 const DEFAULT_ADDRESS_PAGE_SIZE = 50
@@ -393,23 +410,74 @@ export function bulkNodeToCustomer(node: BulkNode): ShopifyCustomerNode {
 
 // ── Failure reporting ────────────────────────────────────────────────────────────────────────
 
+/** The class name of an error, robust to a subclass that sets `name` and to a non-Error throw. */
+function errorLabel(cause: unknown): string {
+  if (cause instanceof Error) {
+    const named = typeof cause.name === 'string' && cause.name.length > 0 && cause.name !== 'Error'
+    return named ? cause.name : cause.constructor?.name || 'Error'
+  }
+  return typeof cause
+}
+
+/**
+ * Reduce an underlying write error to a PII-free classification.
+ *
+ * This is the ONLY detail `describeFailure` is allowed to interpolate, and it is NOT the error's
+ * message: a Zod error quotes the value it rejected, and a database driver can echo the offending
+ * row, either of which is the personal data that must not reach a retained log. What survives is
+ * STRUCTURAL only — a validator's field PATH and rule CODE, the error's class name, a numeric
+ * driver/HTTP status. None of those can carry a value, so the guarantee `describeFailure` makes
+ * about names, emails and addresses still holds. It is the mapper's "codes, never values" rule
+ * (see `MappingNote`), applied to the write path so a failing sync is diagnosable from its log.
+ *
+ * Exported for the PII-containment test that pins this promise.
+ */
+export function classifyWriteFailure(cause: unknown): string {
+  // A ZodError carries `issues[]`, each with a field `path` and a rule `code` — e.g.
+  // `postalCode:too_big`, `primaryEmail:invalid_string`. Deliberately NOT `issue.message` or
+  // `issue.received`, which quote the rejected value.
+  const issues = (cause as { issues?: unknown } | null | undefined)?.issues
+  if (Array.isArray(issues) && issues.length > 0) {
+    const parts = issues.slice(0, 6).map((raw) => {
+      const issue = raw as { path?: unknown; code?: unknown }
+      const path = Array.isArray(issue.path) && issue.path.length > 0 ? issue.path.join('.') : '<root>'
+      const code = typeof issue.code === 'string' && issue.code.length > 0 ? issue.code : 'invalid'
+      return `${path}:${code}`
+    })
+    return `validation ${parts.join(',')}`
+  }
+
+  // Otherwise the class name (`UniqueConstraintViolationException`, `CrudHttpError`, `TypeError`)
+  // plus any numeric/string driver code or HTTP status — a Postgres SQLSTATE like `23505`, never a
+  // value.
+  const parts: string[] = [errorLabel(cause)]
+  const code = (cause as { code?: unknown } | null | undefined)?.code
+  if (typeof code === 'string' || typeof code === 'number') parts.push(`code=${code}`)
+  const status = (cause as { status?: unknown } | null | undefined)?.status
+  if (typeof status === 'number') parts.push(`status=${status}`)
+  return parts.join(' ')
+}
+
 /**
  * The one place an item's `errorMessage` is composed.
  *
  * `logImportItemFailures` renders this string in the admin UI, so it must identify the record
  * without describing it: the Shopify GID and the stage that failed, never a name, email, phone or
- * address. Any underlying message is deliberately NOT interpolated — a Zod error quotes the value
- * it rejected, which is precisely the PII that must not reach a retained log.
+ * address. `detail` — when present — is a `classifyWriteFailure` classification, NEVER a raw
+ * message: it names the failure's shape (a validator path/code, an error class, a status) so an
+ * operator can act on it, and it is safe in a retained, widely-readable log precisely because it
+ * cannot carry a value.
  */
-function describeFailure(externalId: string, stage: string): string {
-  return `Shopify customer ${externalId} failed at ${stage}; details withheld (personal data)`
+function describeFailure(externalId: string, stage: string, detail?: string | null): string {
+  const base = `Shopify customer ${externalId} failed at ${stage}; details withheld (personal data)`
+  return detail ? `${base} [${detail}]` : base
 }
 
-function failedItem(externalId: string, stage: string): ImportItem {
+function failedItem(externalId: string, stage: string, detail?: string | null): ImportItem {
   return {
     externalId,
     action: 'failed',
-    data: { sourceIdentifier: externalId, errorMessage: describeFailure(externalId, stage) },
+    data: { sourceIdentifier: externalId, errorMessage: describeFailure(externalId, stage, detail) },
   }
 }
 
@@ -453,9 +521,12 @@ async function syncAddresses(
   addresses: MappedAddress[],
   log: ((event: CustomerSyncLogEvent) => void) | undefined,
   customerExternalId: string,
-): Promise<{ ok: boolean; written: number; removed: number }> {
+): Promise<{ ok: boolean; written: number; removed: number; detail: string | null }> {
   const writtenLocalIds = new Set<string>()
   let ok = true
+  // The first failing write's PII-free classification, carried up so the item's errorMessage can
+  // say WHY the address stage failed without the underlying value ever leaving this scope.
+  let detail: string | null = null
 
   for (const address of addresses) {
     const outcome = await runtime.writer.upsert({
@@ -474,13 +545,16 @@ async function syncAddresses(
       buildUpdateInput: () => addressInput(address, scope),
     })
     if (outcome.ok) writtenLocalIds.add(outcome.localId)
-    else ok = false
+    else {
+      ok = false
+      if (detail === null) detail = classifyWriteFailure(outcome.cause)
+    }
   }
 
   // Only a complete write lets us conclude anything from absence. If one address failed, a local
   // row missing from `writtenLocalIds` may simply be the one that failed — deleting it then would
   // destroy data because of a transient error.
-  if (!ok) return { ok, written: writtenLocalIds.size, removed: 0 }
+  if (!ok) return { ok, written: writtenLocalIds.size, removed: 0, detail }
 
   let removed = 0
   for (const existing of await runtime.listAddresses(customerLocalId)) {
@@ -497,7 +571,7 @@ async function syncAddresses(
   if (removed > 0) {
     log?.({ kind: 'addresses_removed', externalId: customerExternalId, count: removed })
   }
-  return { ok, written: writtenLocalIds.size, removed }
+  return { ok, written: writtenLocalIds.size, removed, detail }
 }
 
 // ── Customer writing ─────────────────────────────────────────────────────────────────────────
@@ -535,8 +609,8 @@ async function importCustomer(
   let mapped: MappedCustomer
   try {
     mapped = mapCustomer(node)
-  } catch {
-    return { item: failedItem(node.id, 'mapping'), localId: null, updatedAt: null }
+  } catch (error) {
+    return { item: failedItem(node.id, 'mapping', classifyWriteFailure(error)), localId: null, updatedAt: null }
   }
 
   if (mapped.notes.length > 0) {
@@ -570,7 +644,11 @@ async function importCustomer(
   })
 
   if (!outcome.ok) {
-    return { item: failedItem(mapped.externalId, 'customer write'), localId: null, updatedAt: mapped.updatedAt }
+    return {
+      item: failedItem(mapped.externalId, 'customer write', classifyWriteFailure(outcome.cause)),
+      localId: null,
+      updatedAt: mapped.updatedAt,
+    }
   }
 
   if (outcome.action !== 'skip') {
@@ -587,7 +665,7 @@ async function importCustomer(
       // is still right — a partially-addressed customer is not a clean import — and the next run
       // repairs it, because every write here is idempotent.
       return {
-        item: failedItem(mapped.externalId, 'address write'),
+        item: failedItem(mapped.externalId, 'address write', addressResult.detail),
         localId: outcome.localId,
         updatedAt: mapped.updatedAt,
       }
@@ -619,16 +697,32 @@ async function importCustomer(
  *
  * Ownership-gated the same way addresses are, and only ever called when `!input.cursor`.
  */
-async function reconcileCustomers(
+async function* reconcileCustomers(
   runtime: CustomerSyncRuntime,
   scope: TenantScope,
   seenExternalIds: Set<string>,
   log: ((event: CustomerSyncLogEvent) => void) | undefined,
-): Promise<{ deactivated: number; skippedNotOwned: number }> {
+  due: () => boolean,
+  cursor: string,
+  nextBatchIndex: () => number,
+): AsyncIterable<ImportBatch> {
   let deactivated = 0
   let skippedNotOwned = 0
+  let checked = 0
 
   for (const { localId, externalId } of await runtime.listSyncedCustomers()) {
+    checked += 1
+    // Beat BEFORE the ownership branches, and time-gated, so the job stays alive during a long
+    // sweep regardless of how many customers are skipped as already-seen or not-owned. The cursor
+    // is unchanged (nothing to resume mid-sweep) and no items ride along, so no tally moves.
+    if (due()) {
+      yield heartbeatBatch({
+        cursor,
+        batchIndex: nextBatchIndex(),
+        message: `Reconciling Shopify customers… ${checked} checked`,
+      })
+    }
+
     if (seenExternalIds.has(externalId)) continue
 
     const owned = await runtime.lookupExternalId(MAPPING_ENTITY_TYPE.customerEntity, localId)
@@ -650,7 +744,6 @@ async function reconcileCustomers(
   }
 
   log?.({ kind: 'reconciled', deactivated, skippedNotOwned })
-  return { deactivated, skippedNotOwned }
 }
 
 // ── Adapter ──────────────────────────────────────────────────────────────────────────────────
@@ -696,7 +789,6 @@ export function createCustomersAdapter(options: CustomersAdapterOptions): DataSy
 
     let batchIndex = 0
     let pending: ImportItem[] = []
-    let processedCount = 0
 
     // `advanceCursor` promotes the watermark only when no pointer is passed, so `emit` always
     // reports where the run actually is — never where it is about to be.
@@ -706,7 +798,9 @@ export function createCustomersAdapter(options: CustomersAdapterOptions): DataSy
         cursor: serializeCursor(next),
         hasMore,
         batchIndex,
-        processedCount,
+        // Per-batch delta (matching products.ts), NOT a running cumulative: the engine SUMS
+        // `processedCount` across batches, so a cumulative here triangular-inflates the total.
+        processedCount: pending.length,
         ...(message ? { message } : {}),
       }
       pending = []
@@ -718,17 +812,32 @@ export function createCustomersAdapter(options: CustomersAdapterOptions): DataSy
       seenExternalIds.add(node.id)
       const { item, updatedAt } = await importCustomer(runtime, input.scope, node, log)
       pending.push(item)
-      processedCount += 1
       state = advanceCursor(state, { maxUpdatedAt: updatedAt })
     }
 
     const mode: 'backfill' | 'delta' = isFullSync || state?.kind === 'bulk' ? 'backfill' : 'delta'
 
     if (mode === 'backfill') {
-      const exported = await (options.bulkExport ?? runBulkExport)(
-        runtime.client,
-        buildCustomerBulkQuery(),
+      // The bulk export blocks on a poll loop (up to an hour) that yields nothing. Stash the live
+      // operation via `onPoll` and beat while it runs, so the job's heartbeat stays fresh past the
+      // 60s watchdog and the run log shows scan progress — object counts only, never PII.
+      let lastOp: BulkOperation | null = null
+      const exportPromise = (options.bulkExport ?? runBulkExport)(runtime.client, buildCustomerBulkQuery(), {
+        onPoll: (op) => {
+          lastOp = op
+        },
+      })
+      yield* heartbeatWhile(
+        exportPromise,
+        () =>
+          heartbeatBatch({
+            cursor: serializeCursor(state ?? { kind: 'idle', updatedAfter: null }),
+            batchIndex: batchIndex++,
+            message: `Exporting Shopify customers… ${lastOp?.objectCount ?? 0} rows scanned`,
+          }),
+        { intervalMs: options.heartbeatIntervalMs, clock: options.heartbeatClock },
       )
+      const exported = await exportPromise
 
       if (exported.partial) {
         log?.({ kind: 'bulk_partial', objectCount: exported.operation.objectCount })
@@ -805,13 +914,22 @@ export function createCustomersAdapter(options: CustomersAdapterOptions): DataSy
         log?.({ kind: 'batch', batchIndex, items: pending.length, mode })
         yield emit(state, true)
       }
-      await reconcileCustomers(runtime, input.scope, seenExternalIds, log)
+      yield* reconcileCustomers(
+        runtime,
+        input.scope,
+        seenExternalIds,
+        log,
+        makeReconcileHeartbeat({ intervalMs: options.heartbeatIntervalMs, now: options.now }),
+        serializeCursor(state),
+        () => batchIndex++,
+      )
       yield {
         items: [],
         cursor: serializeCursor(state),
         hasMore: false,
         batchIndex,
-        processedCount,
+        // Terminal reconcile batch carries no items; its per-batch delta is 0.
+        processedCount: 0,
         refreshCoverageEntityTypes: [OM_ENTITY_ID.customerEntity],
         message: 'Reconciling Shopify customers after the final batch',
       }

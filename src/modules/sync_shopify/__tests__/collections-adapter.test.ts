@@ -8,8 +8,9 @@ import {
   type CollectionsRunContext,
 } from '../lib/adapters/collections'
 import { createEntityWriter, type EntityRow, type FindOnePort } from '../lib/writer'
-import { parseCursor } from '../lib/cursor'
+import { parseCursor, serializeCursor } from '../lib/cursor'
 import type { ShopifyClient } from '../lib/client'
+import type { HeartbeatClock } from '../lib/heartbeat'
 import type { ImportBatch, StreamImportInput } from '@open-mercato/core/modules/data_sync/lib/adapter'
 
 /**
@@ -262,6 +263,105 @@ const memberLine = (productId: number, collectionId: number) =>
     id: `gid://shopify/Product/${productId}`,
     __parentId: `gid://shopify/Collection/${collectionId}`,
   })
+
+// ── Heartbeat test doubles ───────────────────────────────────────────────────────────────────
+
+/** A promise whose settlement the test controls, for holding the bulk export open mid-run. */
+function makeDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+/** A `HeartbeatClock` whose bulk-poll timers fire only when the test says so. */
+function makeFakeHeartbeatClock() {
+  type Timer = { cb: () => void; dead: boolean }
+  const timers: Timer[] = []
+  const clock: HeartbeatClock = {
+    setTimer: (_ms, cb) => {
+      const timer: Timer = { cb, dead: false }
+      timers.push(timer)
+      return () => {
+        timer.dead = true
+      }
+    },
+  }
+  return {
+    clock,
+    /** Fire the most recent live timer, mimicking one interval elapsing. */
+    fireNext(): boolean {
+      for (let i = timers.length - 1; i >= 0; i -= 1) {
+        if (!timers[i].dead) {
+          timers[i].dead = true
+          timers[i].cb()
+          return true
+        }
+      }
+      return false
+    },
+  }
+}
+
+/** Hop the macrotask boundary so the adapter generator reaches its next await/yield. */
+const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+async function drainBatches(iterator: AsyncIterator<ImportBatch>): Promise<ImportBatch[]> {
+  const out: ImportBatch[] = []
+  for (;;) {
+    const result = await iterator.next()
+    if (result.done) break
+    out.push(result.value)
+  }
+  return out
+}
+
+/**
+ * Bulk deps whose poll response is deferred, holding `openBulkStream` open mid-poll.
+ *
+ * Collections has no `bulkExport` seam (it drives `openBulkStream` internally), so the poll is held
+ * open at the transport: the `bulkOperation(id:)` query returns `poll`, which the test resolves
+ * with the terminal operation once it has observed a heartbeat.
+ */
+function makeDeferredBulkDeps(world: World, lines: string[], poll: Promise<unknown>): CollectionsAdapterDeps {
+  const client = makeClient((query) => {
+    if (query.includes('bulkOperationRunQuery')) {
+      return {
+        bulkOperationRunQuery: {
+          bulkOperation: { id: 'gid://shopify/BulkOperation/1', status: 'CREATED' },
+          userErrors: [],
+        },
+      }
+    }
+    if (query.includes('bulkOperation(id:')) {
+      // Held open until the test resolves `poll`, so the poll phase is observably in progress.
+      return poll
+    }
+    throw new Error(`unexpected bulk query: ${query.slice(0, 60)}`)
+  })
+
+  return {
+    createClient: () => client,
+    createRunContext: async () => world.runContext,
+    bulkOptions: {
+      sleep: async () => undefined,
+      fetchImpl: (async () => jsonlBody(lines)) as never,
+    },
+  }
+}
+
+/** The terminal poll response a deferred bulk export resolves with. */
+const completedBulkOperation = (objectCount: number) => ({
+  bulkOperation: {
+    id: 'gid://shopify/BulkOperation/1',
+    status: 'COMPLETED',
+    url: BULK_RESULT_URL,
+    objectCount,
+  },
+})
 
 // ── Adapter shape ────────────────────────────────────────────────────────────────────────────
 
@@ -861,5 +961,81 @@ describe('what the run reports', () => {
     expect(parked?.kind).toBe('bulk')
     // A crash here resumes the same operation rather than paying for a new export.
     expect(parked).toMatchObject({ bulkOperationId: 'gid://shopify/BulkOperation/1' })
+  })
+})
+
+// ── Liveness heartbeats + count accuracy ─────────────────────────────────────────────────────
+
+describe('liveness heartbeats', () => {
+  it('beats while the bulk export is still polling, before the first data batch', async () => {
+    const world = makeWorld()
+    mapProduct(world, 'gid://shopify/Product/10', 'prod-10')
+
+    const poll = makeDeferred<unknown>()
+    const fake = makeFakeHeartbeatClock()
+    const adapter = createShopifyCollectionsAdapter({
+      ...makeDeferredBulkDeps(world, [collectionLine(1, 'Summer'), memberLine(10, 1)], poll.promise),
+      heartbeatClock: fake.clock,
+    })
+
+    const iterator = adapter.streamImport!(streamInput())[Symbol.asyncIterator]()
+
+    // First pull: the poll has not resolved, so an empty heartbeat must arrive before any data.
+    const firstPull = iterator.next()
+    await flushAsync() // let the generator arm its heartbeat timer
+    expect(fake.fireNext()).toBe(true)
+    const beat = await firstPull
+
+    expect(beat.done).toBe(false)
+    expect(beat.value.items).toEqual([]) // empty — no created/updated/skipped/failed delta
+    expect('processedCount' in beat.value).toBe(false) // adds 0 to the engine total
+    expect(beat.value.message).toMatch(/rows scanned/)
+    // The heartbeat carried the pre-export cursor unchanged (nothing to resume into mid-poll).
+    expect(beat.value.cursor).toBe(serializeCursor({ kind: 'idle', updatedAfter: null }))
+
+    // Let the poll finish; the remainder of the run imports the collection from the JSONL export.
+    poll.resolve(completedBulkOperation(2))
+    const rest = await drainBatches(iterator)
+
+    const items = rest.flatMap((batch) => batch.items)
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({ action: 'create', externalId: 'gid://shopify/Collection/1' })
+    // The whole pipeline resumed after the beat: the member landed as an assignment.
+    expect([...world.assignments.get('prod-10')!]).toEqual(['cat-1'])
+  })
+
+  it('a fast-resolving bulk export yields NO heartbeat, so existing sequences are unchanged', async () => {
+    const world = makeWorld()
+    const fake = makeFakeHeartbeatClock()
+    const batches = await drain(
+      createShopifyCollectionsAdapter({
+        ...makeBulkDeps(world, [collectionLine(1, 'Summer')]),
+        heartbeatClock: fake.clock,
+      }).streamImport!(streamInput()),
+    )
+    // The stubbed export settles on a microtask — long before any interval — so the timer is
+    // cancelled unfired and no empty heartbeat batch enters the stream.
+    const heartbeats = batches.filter((batch) => batch.items.length === 0 && /rows scanned/.test(batch.message ?? ''))
+    expect(heartbeats).toHaveLength(0)
+    expect(fake.fireNext()).toBe(false)
+  })
+
+  it('reports processedCount as a per-batch delta that sums to the true collection count', async () => {
+    const world = makeWorld()
+    const adapter = createShopifyCollectionsAdapter(
+      makeBulkDeps(world, [collectionLine(1, 'Summer'), collectionLine(2, 'Sale'), collectionLine(3, 'New In')]),
+    )
+
+    // batchSize 2 over 3 collections → the backfill emits data batches of 2, then 1.
+    const batches = await drain(adapter.streamImport!(streamInput({ batchSize: 2 })))
+
+    // The engine SUMS processedCount across batches; a per-batch delta must total the real count
+    // exactly, with no triangular inflation from a running cumulative.
+    const totalProcessed = batches.reduce((sum, batch) => sum + (batch.processedCount ?? 0), 0)
+    expect(totalProcessed).toBe(3)
+
+    for (const batch of batches) {
+      if (batch.items.length > 0) expect(batch.processedCount).toBe(batch.items.length)
+    }
   })
 })

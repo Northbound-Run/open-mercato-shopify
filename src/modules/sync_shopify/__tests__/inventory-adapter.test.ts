@@ -36,9 +36,10 @@ import { addDays, type InventoryHistoryScope, type InventorySnapshotRow } from '
 import { OOS_MIN_OBSERVED_DAYS } from '../lib/constants'
 import { INTEGRATION_ID, MAPPING_ENTITY_TYPE, OM_ENTITY_ID } from '../lib/constants'
 import { CostTracker } from '../lib/throttle'
+import type { HeartbeatClock } from '../lib/heartbeat'
 import type { ShopifyClient } from '../lib/client'
 import type { BulkNode } from '../lib/bulk'
-import type { StreamImportInput } from '@open-mercato/core/modules/data_sync/lib/adapter'
+import type { ImportBatch, StreamImportInput } from '@open-mercato/core/modules/data_sync/lib/adapter'
 
 const SCOPE: InventoryHistoryScope = {
   organizationId: '11111111-1111-1111-1111-111111111111',
@@ -259,6 +260,8 @@ function createHarness(options: {
   timezone?: string
   localVariantId?: string | null
   withCustomFields?: boolean
+  heartbeatClock?: HeartbeatClock
+  heartbeatIntervalMs?: number
 }) {
   const store = options.store ?? createFakeStore()
   const { client, requests } = createFakeClient({
@@ -290,6 +293,8 @@ function createHarness(options: {
           },
     now: () => CAPTURED_AT,
     onAnomaly: (anomaly) => anomalies.push(anomaly),
+    ...(options.heartbeatClock ? { heartbeatClock: options.heartbeatClock } : {}),
+    ...(options.heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs: options.heartbeatIntervalMs } : {}),
   })
 
   return { adapter, store, customFieldCalls, anomalies, lookups, requests }
@@ -865,7 +870,11 @@ describe('createShopifyInventoryAdapter', () => {
     expect(batches).toHaveLength(2)
     expect(batches[0].hasMore).toBe(true)
     expect(batches[1].hasMore).toBe(false)
-    expect(batches[1].processedCount).toBe(2)
+    // Per-batch delta now, not a running cumulative: each single-variant page reports 1, and the
+    // engine sums them to the true count of 2. The old cumulative reported 2 on the second batch,
+    // which the engine then summed to a triangular 3.
+    expect(batches[0].processedCount).toBe(1)
+    expect(batches[1].processedCount).toBe(1)
 
     const variantRequests = requests.filter((request) => request.query.includes('SyncShopifyInventoryVariants'))
     expect(variantRequests[0].variables).toMatchObject({ first: DEFAULT_PAGE_SIZE, after: null })
@@ -1129,5 +1138,172 @@ describe('createShopifyInventoryAdapter', () => {
 
     expect(result.ok).toBe(false)
     expect(result.message).toMatch(/read_locations/)
+  })
+})
+
+// ── Liveness heartbeats ───────────────────────────────────────────────────────────────────────
+
+/** A promise whose settlement the test controls, for holding the first page load open mid-run. */
+function makeDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+/** A `HeartbeatClock` whose bulk-poll timers fire only when the test says so. */
+function makeFakeHeartbeatClock() {
+  type Timer = { cb: () => void; dead: boolean }
+  const timers: Timer[] = []
+  const clock: HeartbeatClock = {
+    setTimer: (_ms, cb) => {
+      const timer: Timer = { cb, dead: false }
+      timers.push(timer)
+      return () => {
+        timer.dead = true
+      }
+    },
+  }
+  return {
+    clock,
+    /** Fire the most recent live timer, mimicking one interval elapsing. */
+    fireNext(): boolean {
+      for (let i = timers.length - 1; i >= 0; i -= 1) {
+        if (!timers[i].dead) {
+          timers[i].dead = true
+          timers[i].cb()
+          return true
+        }
+      }
+      return false
+    },
+  }
+}
+
+/** Hop the macrotask boundary so the adapter generator reaches its next await/yield. */
+const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+async function drainBatches(iterator: AsyncIterator<ImportBatch>): Promise<ImportBatch[]> {
+  const out: ImportBatch[] = []
+  for (;;) {
+    const result = await iterator.next()
+    if (result.done) break
+    out.push(result.value)
+  }
+  return out
+}
+
+describe('inventory liveness heartbeats', () => {
+  it('beats while the first page is still loading, before any data batch', async () => {
+    // Inventory has no injectable bulk seam and its adapter tests take the PAGED path (195 < the
+    // bulk threshold), so the silent phase is exercised by gating the first variant request. The
+    // heartbeat wraps the first source pull regardless of path, so a slow paged first page is the
+    // same observable stall as a long bulk poll.
+    const gate = makeDeferred<void>()
+    const fake = makeFakeHeartbeatClock()
+    const store = createFakeStore()
+
+    let variantRequests = 0
+    const client = {
+      shopDomain: 'test.myshopify.com',
+      apiVersion: '2026-07',
+      cost: new CostTracker(),
+      async request<TData>(query: string): Promise<TData> {
+        if (query.includes('SyncShopifyShopTimezone')) return { shop: { ianaTimezone: LA } } as TData
+        if (query.includes('SyncShopifyProductVariantsCount')) {
+          return { productVariantsCount: { count: 195 } } as TData
+        }
+        if (query.includes('SyncShopifyInventoryVariants')) {
+          // Only the first page hangs; once the gate opens the run proceeds normally.
+          if (variantRequests++ === 0) await gate.promise
+          return {
+            productVariants: {
+              edges: [variantNode()].map((node) => ({ node })),
+              pageInfo: { hasNextPage: false, endCursor: 'cursor-1' },
+            },
+          } as TData
+        }
+        throw new Error(`unexpected query: ${query.slice(0, 60)}`)
+      },
+    } as unknown as ShopifyClient
+
+    const adapter = createShopifyInventoryAdapter({
+      createClient: () => client,
+      store,
+      externalIdMapping: {
+        async lookupLocalId() {
+          return LOCAL_VARIANT_ID
+        },
+        async storeExternalIdMapping() {
+          throw new Error('unreachable')
+        },
+      },
+      writeCustomFields: async () => {},
+      now: () => CAPTURED_AT,
+      heartbeatClock: fake.clock,
+    })
+
+    const iterator = adapter.streamImport!(importInput())[Symbol.asyncIterator]()
+
+    // First pull: the page has not loaded, so an empty heartbeat must arrive first.
+    const firstPull = iterator.next()
+    await flushAsync() // let the generator arm its heartbeat timer
+    expect(fake.fireNext()).toBe(true)
+    const beat = await firstPull
+
+    expect(beat.done).toBe(false)
+    expect(beat.value.items).toEqual([]) // empty — no created/updated/skipped/failed delta
+    expect('processedCount' in beat.value).toBe(false) // adds 0 to the engine total
+    expect(beat.value.message).toMatch(/rows scanned/)
+    // The heartbeat carried the pre-page cursor unchanged (nothing to resume into mid-poll).
+    expect(beat.value.cursor).toBe(serializeInventoryCursor({ snapshotDate: LA_DAY, endCursor: null }))
+
+    // Open the gate; the remainder of the run carries the real variant snapshot.
+    gate.resolve()
+    const rest = await drainBatches(iterator)
+
+    const all = [beat.value, ...rest]
+    const dataItems = all.flatMap((b) => b.items)
+    expect(dataItems).toHaveLength(1)
+    expect(dataItems[0]).toMatchObject({ action: 'create', externalId: VARIANT })
+    // One variant scanned, counted exactly once: the heartbeat added 0, the data batch added 1.
+    const totalProcessed = all.reduce((sum, b) => sum + (b.processedCount ?? 0), 0)
+    expect(totalProcessed).toBe(1)
+    expect(store.all()).toHaveLength(1)
+  })
+
+  it('a fast-resolving first page yields NO heartbeat, so existing sequences are unchanged', async () => {
+    const fake = makeFakeHeartbeatClock()
+    // The stubbed request settles on a microtask — long before any interval — so the timer is
+    // cancelled unfired and no empty heartbeat batch enters the stream.
+    const { adapter } = createHarness({ pages: onePage([variantNode()]), heartbeatClock: fake.clock })
+
+    const batches = await drain(adapter, importInput())
+
+    const heartbeats = batches.filter((b) => b.items.length === 0 && /rows scanned/.test(b.message ?? ''))
+    expect(heartbeats).toHaveLength(0)
+    expect(fake.fireNext()).toBe(false)
+    expect(batches).toHaveLength(1)
+    expect(batches[0].items[0]).toMatchObject({ action: 'create', externalId: VARIANT })
+  })
+
+  it('reports processedCount as a per-batch delta that sums to the true variant count', async () => {
+    // Two single-variant pages. The engine SUMS processedCount across batches, so a per-batch delta
+    // must total the real count of 2 exactly — no triangular inflation from a running cumulative.
+    const { adapter } = createHarness({
+      pages: [
+        { nodes: [variantNode({ id: VARIANT })], endCursor: 'page-1', hasNextPage: true },
+        { nodes: [variantNode({ id: OTHER_VARIANT })], endCursor: 'page-2', hasNextPage: false },
+      ],
+    })
+
+    const batches = await drain(adapter, importInput())
+
+    const totalProcessed = batches.reduce((sum, b) => sum + (b.processedCount ?? 0), 0)
+    expect(totalProcessed).toBe(2)
+    for (const b of batches) expect(b.processedCount).toBe(b.items.length)
   })
 })

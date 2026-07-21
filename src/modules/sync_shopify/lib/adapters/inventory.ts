@@ -42,7 +42,15 @@ import type {
   ValidationResult,
 } from '@open-mercato/core/modules/data_sync/lib/adapter'
 import type { ShopifyClient } from '../client'
-import { childrenOfType, parseGid, runBulkExport, type BulkAnomaly, type BulkNode } from '../bulk'
+import {
+  childrenOfType,
+  parseGid,
+  runBulkExport,
+  type BulkAnomaly,
+  type BulkExportOptions,
+  type BulkNode,
+  type BulkOperation,
+} from '../bulk'
 import {
   ENTITY_TYPE,
   INTEGRATION_ID,
@@ -72,6 +80,7 @@ import {
   type CustomFieldWriterPort,
   type ExternalIdMappingPort,
 } from '../writer'
+import { heartbeatBatch, heartbeatWhile, type HeartbeatClock } from '../heartbeat'
 
 // ── Tuning ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -302,6 +311,15 @@ export type InventoryAdapterDeps = {
    */
   includeInactiveProducts?: boolean
   onAnomaly?: (anomaly: InventoryAnomaly) => void
+  /**
+   * Beat cadence for the bulk-poll liveness heartbeat. Defaults to `DEFAULT_HEARTBEAT_INTERVAL_MS`
+   * (15s). Production omits it; tests set it small. There is no reconcile sweep here — inventory is
+   * a full snapshot with no owned-record deactivation — so the only silent phase to cover is the
+   * export/first-page poll.
+   */
+  heartbeatIntervalMs?: number
+  /** Injectable timer for the bulk-poll heartbeat; defaults to real `setTimeout`. Tests only. */
+  heartbeatClock?: HeartbeatClock
 }
 
 // ── Fetch strategy ──────────────────────────────────────────────────────────────────────────────
@@ -440,7 +458,7 @@ export function bulkReassemblyError(anomalies: readonly BulkAnomaly[]): Error {
 
 async function* bulkVariantPages(
   client: ShopifyClient,
-  options: { pageSize: number },
+  options: { pageSize: number; onPoll?: BulkExportOptions['onPoll'] },
 ): AsyncIterable<VariantPage> {
   const orphans: BulkAnomaly[] = []
   const exported = await runBulkExport(client, VARIANTS_BULK_QUERY, {
@@ -451,6 +469,9 @@ async function* bulkVariantPages(
       // type turned up, rather than dying on the first one with no context.
       orphans.push(anomaly)
     },
+    // The bulk poll blocks for well over a minute on a real catalog; `onPoll` lets `streamImport`
+    // stash the live operation so its heartbeat can report scan progress (object counts only).
+    ...(options.onPoll ? { onPoll: options.onPoll } : {}),
   })
 
   if (!exported.nodes) {
@@ -636,15 +657,47 @@ export function createShopifyInventoryAdapter(deps: InventoryAdapterDeps): DataS
     // A bulk export cannot be resumed part-way through its stream, so a resume request falls back
     // to a fresh export. Re-reading is wasteful; writing half a day under the wrong date is not
     // recoverable.
+    //
+    // The live bulk operation is stashed via `onPoll` so the heartbeat below can report scan
+    // progress — object counts only, never a value. Only the bulk path polls; the paged path makes
+    // an ordinary request whose `onPoll` is never called, and `lastOp` simply stays null there.
+    let lastOp: BulkOperation | null = null
     const pages =
       mode === 'bulk'
-        ? bulkVariantPages(client, { pageSize })
+        ? bulkVariantPages(client, { pageSize, onPoll: (op) => { lastOp = op } })
         : pagedVariantPages(client, { pageSize, after: resumed?.endCursor ?? null })
 
-    let batchIndex = 0
-    let processedCount = 0
+    // The cursor a beat re-persists: wherever this run will actually resume from. Bulk cannot resume
+    // mid-stream, so it round-trips to "start this day over" — exactly where the poll still is.
+    const pollCursor = serializeInventoryCursor({ snapshotDate, endCursor: resumed?.endCursor ?? null })
 
-    for await (const page of pages) {
+    let batchIndex = 0
+
+    // Drive the source by hand so the FIRST pull — the one blocked on the bulk export poll (up to an
+    // hour of silence that would otherwise trip the 60s stale-job watchdog) — can be raced against a
+    // heartbeat timer. Later pulls stream from an already-running download and each yields a data
+    // batch, which refreshes the job's heartbeat on its own; only the first pull can run silent.
+    const iterator = pages[Symbol.asyncIterator]()
+    let firstPull = true
+
+    for (;;) {
+      const advance = iterator.next()
+      if (firstPull) {
+        firstPull = false
+        yield* heartbeatWhile(
+          advance,
+          () =>
+            heartbeatBatch({
+              cursor: pollCursor,
+              batchIndex: batchIndex++,
+              message: `Exporting Shopify inventory… ${lastOp?.objectCount ?? 0} rows scanned`,
+            }),
+          { intervalMs: deps.heartbeatIntervalMs, clock: deps.heartbeatClock },
+        )
+      }
+      const result = await advance
+      if (result.done) break
+      const page = result.value
       const items: ImportItem[] = []
       const mappedByVariant: MappedVariantInventory[] = []
       const rows: InventorySnapshotDraft[] = []
@@ -742,14 +795,15 @@ export function createShopifyInventoryAdapter(deps: InventoryAdapterDeps): DataS
         })
       }
 
-      processedCount += items.length
-
       yield {
         items,
         cursor: serializeInventoryCursor({ snapshotDate, endCursor: page.endCursor }),
         hasMore: page.hasMore,
         batchIndex,
-        processedCount,
+        // Per-batch delta (matching products.ts), NOT a running cumulative: the engine SUMS
+        // processedCount across batches, so a cumulative here would triangular-inflate the total.
+        // Empty heartbeat batches omit the key entirely, so they add 0 and never double-count.
+        processedCount: items.length,
         ...(variantCount !== null ? { totalEstimate: variantCount } : {}),
         // Custom-field values landed on the variant, so its coverage needs refreshing.
         refreshCoverageEntityTypes: [OM_ENTITY_ID.productVariant],

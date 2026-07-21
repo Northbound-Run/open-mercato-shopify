@@ -7,7 +7,7 @@ import type {
   TenantScope,
 } from '@open-mercato/core/modules/data_sync/lib/adapter'
 import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../client'
-import type { BulkExport, BulkNode } from '../bulk'
+import type { BulkExport, BulkExportOptions, BulkNode, BulkOperation } from '../bulk'
 import { childrenOfType, runBulkExport } from '../bulk'
 import {
   COMMAND,
@@ -36,6 +36,12 @@ import {
   type ShopifyOrderLine,
   type ShopifyOrderNode,
 } from '../mappers/order'
+import {
+  heartbeatBatch,
+  heartbeatWhile,
+  makeReconcileHeartbeat,
+  type HeartbeatClock,
+} from '../heartbeat'
 
 /**
  * The Shopify orders import adapter — the largest and the one where correctness is hardest to prove.
@@ -138,8 +144,21 @@ export type OrdersAdapterOptions = {
     scope: TenantScope
   }): Promise<OrderSyncRuntime>
   log?: (event: OrderSyncLogEvent) => void
-  /** Overridden in tests so the backfill path runs without a real bulk operation. */
-  bulkExport?: (client: ShopifyClient, query: string) => Promise<BulkExport>
+  /**
+   * Overridden in tests so the backfill path runs without a real bulk operation. Accepts the real
+   * `BulkExportOptions` so the bulk-poll heartbeat can compose an `onPoll` callback onto it; the
+   * existing 2-arg test stubs remain assignable.
+   */
+  bulkExport?: (client: ShopifyClient, query: string, options?: BulkExportOptions) => Promise<BulkExport>
+  /**
+   * Beat cadence for the liveness heartbeats (bulk-poll and reconcile sweep). Defaults to
+   * `DEFAULT_HEARTBEAT_INTERVAL_MS`. Production omits it; tests set it small.
+   */
+  heartbeatIntervalMs?: number
+  /** Injectable timer for the bulk-poll heartbeat; defaults to real `setTimeout`. Tests only. */
+  heartbeatClock?: HeartbeatClock
+  /** Injectable clock for the reconcile-sweep heartbeat gate; defaults to `Date.now`. Tests only. */
+  now?: () => number
 }
 
 /** Shopify caps a page at 250; orders are heavy, so the delta default is smaller. */
@@ -639,18 +658,39 @@ async function importOrder(
  * 🔴 Only ever reached behind BOTH guards: `!input.cursor` and `window === 'full'`. Orders are the
  * customer's financial history — a reconcile that ran against a 60-day-limited backfill would delete
  * every order older than 60 days. Ownership-gated the same way every other reconcile is.
+ *
+ * A generator, not a plain async function: a large owned-order set makes this sweep run silent for
+ * well past the 60s watchdog, so it yields a time-gated heartbeat to keep the job alive. The
+ * soft-delete items it produces are handed back through the generator's RETURN value, which the
+ * caller captures via `yield*` and emits on the terminal reconcile batch exactly as before.
  */
-async function reconcileOrders(
+async function* reconcileOrders(
   runtime: OrderSyncRuntime,
   scope: TenantScope,
   seenLocalIds: Set<string>,
   log: ((event: OrderSyncLogEvent) => void) | undefined,
-): Promise<ImportItem[]> {
+  due: () => boolean,
+  cursor: string,
+  nextBatchIndex: () => number,
+): AsyncGenerator<ImportBatch, ImportItem[]> {
   const items: ImportItem[] = []
   let deactivated = 0
   let skippedNotOwned = 0
+  let checked = 0
 
   for (const localId of await runtime.listOwnedOrderIds()) {
+    checked += 1
+    // Beat BEFORE the ownership branches, and time-gated, so the job stays alive during a long
+    // sweep regardless of how many orders are skipped as already-seen or not-owned. The cursor is
+    // unchanged (nothing to resume mid-sweep) and no items ride along, so no tally moves.
+    if (due()) {
+      yield heartbeatBatch({
+        cursor,
+        batchIndex: nextBatchIndex(),
+        message: `Reconciling Shopify orders… ${checked} checked`,
+      })
+    }
+
     if (seenLocalIds.has(localId)) continue
     const externalId = await runtime.mapping.lookupExternalId(
       INTEGRATION_ID.orders,
@@ -722,7 +762,6 @@ export function createOrdersAdapter(options: OrdersAdapterOptions): DataSyncAdap
 
     let batchIndex = 0
     let pending: ImportItem[] = []
-    let processedCount = 0
 
     const emit = (next: ShopifyCursorState, hasMore: boolean, message?: string): ImportBatch => {
       const batch: ImportBatch = {
@@ -730,7 +769,9 @@ export function createOrdersAdapter(options: OrdersAdapterOptions): DataSyncAdap
         cursor: serializeCursor(next),
         hasMore,
         batchIndex,
-        processedCount,
+        // Per-batch delta (matching products.ts / customers.ts), NOT a running cumulative: the engine
+        // SUMS `processedCount` across batches, so a cumulative here triangular-inflates the total.
+        processedCount: pending.length,
         ...(message ? { message } : {}),
       }
       pending = []
@@ -741,7 +782,6 @@ export function createOrdersAdapter(options: OrdersAdapterOptions): DataSyncAdap
     async function handle(node: ShopifyOrderNode): Promise<void> {
       const result = await importOrder(runtime, input.scope, node, log)
       pending.push(...result.items)
-      processedCount += 1
       if (result.localId !== null) seenLocalIds.add(result.localId)
       state = advanceCursor(state, { maxUpdatedAt: result.updatedAt })
     }
@@ -749,7 +789,27 @@ export function createOrdersAdapter(options: OrdersAdapterOptions): DataSyncAdap
     const mode: 'backfill' | 'delta' = isFullSync || state?.kind === 'bulk' ? 'backfill' : 'delta'
 
     if (mode === 'backfill') {
-      const exported = await (options.bulkExport ?? runBulkExport)(runtime.client, buildOrderBulkQuery())
+      // The bulk export blocks on a poll loop (up to an hour) that yields nothing. Stash the live
+      // operation via `onPoll` and beat while it runs, so the job's heartbeat stays fresh past the
+      // 60s watchdog and the run log shows scan progress — object counts only, never PII (and an
+      // order's object count never reveals the customer behind it).
+      let lastOp: BulkOperation | null = null
+      const exportPromise = (options.bulkExport ?? runBulkExport)(runtime.client, buildOrderBulkQuery(), {
+        onPoll: (op) => {
+          lastOp = op
+        },
+      })
+      yield* heartbeatWhile(
+        exportPromise,
+        () =>
+          heartbeatBatch({
+            cursor: serializeCursor(state ?? { kind: 'idle', updatedAfter: null }),
+            batchIndex: batchIndex++,
+            message: `Exporting Shopify orders… ${lastOp?.objectCount ?? 0} rows scanned`,
+          }),
+        { intervalMs: options.heartbeatIntervalMs, clock: options.heartbeatClock },
+      )
+      const exported = await exportPromise
       if (exported.partial) log?.({ kind: 'bulk_partial', objectCount: exported.operation.objectCount })
 
       if (exported.nodes) {
@@ -816,10 +876,23 @@ export function createOrdersAdapter(options: OrdersAdapterOptions): DataSyncAdap
         log?.({ kind: 'batch', batchIndex, items: pending.length, mode })
         yield emit(state, true)
       }
-      const reconcileItems = await reconcileOrders(runtime, input.scope, seenLocalIds, log)
+      // `yield*` delegates the reconcile sweep's heartbeats into this stream and, at the end, hands
+      // back the soft-delete items via the generator's return value.
+      const reconcileItems = yield* reconcileOrders(
+        runtime,
+        input.scope,
+        seenLocalIds,
+        log,
+        makeReconcileHeartbeat({ intervalMs: options.heartbeatIntervalMs, now: options.now }),
+        serializeCursor(state),
+        () => batchIndex++,
+      )
       pending.push(...reconcileItems)
       yield {
         ...emit(state, false, 'Reconciling Shopify orders after the final batch'),
+        // Reconcile soft-deletes are not "processed source orders": the terminal batch carries them
+        // for reporting but contributes 0 to the engine's running total.
+        processedCount: 0,
         refreshCoverageEntityTypes: [OM_ENTITY_ID.salesOrder],
       }
       return

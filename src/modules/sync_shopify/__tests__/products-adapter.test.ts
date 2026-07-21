@@ -1,5 +1,7 @@
 import type { ImportBatch, StreamImportInput } from '@open-mercato/core/modules/data_sync/lib/adapter'
 import type { ShopifyClient } from '../lib/client'
+import type { BulkExportOptions } from '../lib/bulk'
+import type { HeartbeatClock } from '../lib/heartbeat'
 import { parseCursor } from '../lib/cursor'
 import { createShopifyProductsAdapter, type ProductsRuntime } from '../lib/adapters/products'
 import type { EntityRow, EntityWriter, UpsertSpec, WriteOutcome } from '../lib/writer'
@@ -147,8 +149,17 @@ function makeClient(script: ClientScript) {
   return { client, requests }
 }
 
+/** Opt-in knobs for the liveness-heartbeat tests. Omit them and the adapter uses real timers. */
+type HarnessExtra = {
+  heartbeatIntervalMs?: number
+  heartbeatClock?: HeartbeatClock
+  now?: () => number
+  /** Overrides merged over the default `sleep`/`fetchImpl` — e.g. a gated download. */
+  bulkOptions?: Partial<BulkExportOptions>
+}
+
 /** `previous` continues an earlier run against the same store. Omit it for a fresh install. */
-function makeHarness(script: ClientScript = {}, previous?: { store: Store }) {
+function makeHarness(script: ClientScript = {}, previous?: { store: Store }, extra: HarnessExtra = {}) {
   const store: Store = previous?.store ?? { rows: new Map(), mappings: new Map() }
   const writes: WriteRecord[] = []
   const writer = makeWriter(store, writes)
@@ -220,7 +231,11 @@ function makeHarness(script: ClientScript = {}, previous?: { store: Store }) {
     bulkOptions: {
       sleep: async () => {},
       fetchImpl: async () => new Response(script.jsonl ?? '') as unknown as Response,
+      ...extra.bulkOptions,
     },
+    heartbeatIntervalMs: extra.heartbeatIntervalMs,
+    heartbeatClock: extra.heartbeatClock,
+    now: extra.now,
   })
 
   return { adapter, store, writer, writes, requests, runtime, priceKinds, calls }
@@ -942,5 +957,125 @@ describe('failure handling', () => {
   it('refuses to guess a currency when the shop reports none', async () => {
     const h = makeHarness({ jsonl: jsonl(PRODUCT_1, [VARIANT_A]), currencyCode: null })
     await expect(collect(h)).rejects.toThrow(/refusing to guess/)
+  })
+})
+
+// ── Liveness heartbeats ──────────────────────────────────────────────────────────────────────
+
+describe('liveness heartbeats', () => {
+  it('beats while the bulk export is in flight, before the first data batch', async () => {
+    // Hold the JSONL download open so the first source pull — which spans the bulk poll and the
+    // download — stays pending across a beat. `runBulkExport` resolves after polling; the gated
+    // fetch below is what the first `iterator.next()` then blocks on. The heartbeat must be yielded
+    // from `streamImport` while that pull is in flight, which is the whole point of driving the
+    // source iterator by hand.
+    let releaseFetch!: () => void
+    const gate = new Promise<void>((resolve) => {
+      releaseFetch = resolve
+    })
+
+    // A fake beat timer that fires exactly one beat, on a microtask, while work is still pending.
+    // Firing once keeps the test deterministic: after the beat the loop simply parks on work's
+    // settlement, so there is no unbounded microtask race against the release below.
+    let armed = true
+    const heartbeatClock: HeartbeatClock = {
+      setTimer: (_ms, cb) => {
+        if (armed) {
+          armed = false
+          void Promise.resolve().then(cb)
+        }
+        return () => {}
+      },
+    }
+
+    const h = makeHarness({ jsonl: jsonl(PRODUCT_1, [VARIANT_A]) }, undefined, {
+      heartbeatIntervalMs: 15_000,
+      heartbeatClock,
+      bulkOptions: {
+        fetchImpl: (async () => {
+          await gate
+          return new Response(jsonl(PRODUCT_1, [VARIANT_A])) as unknown as Response
+        }) as BulkExportOptions['fetchImpl'],
+      },
+    })
+
+    const input: StreamImportInput = {
+      entityType: 'shopify.product',
+      batchSize: 50,
+      credentials: CREDENTIALS,
+      mapping: await h.adapter.getMapping({ entityType: 'shopify.product', scope: SCOPE }),
+      scope: SCOPE,
+    }
+
+    const batches: ImportBatch[] = []
+    let released = false
+    for await (const batch of h.adapter.streamImport!(input)) {
+      batches.push(batch)
+      // Release the download the instant the first (heartbeat) batch lands, so the run completes.
+      if (!released && batch.items.length === 0) {
+        released = true
+        releaseFetch()
+      }
+    }
+
+    // A heartbeat preceded the first data batch.
+    const firstDataIndex = batches.findIndex((b) => b.items.length > 0)
+    expect(firstDataIndex).toBeGreaterThan(0)
+
+    const heartbeat = batches[0]!
+    expect(heartbeat.items).toHaveLength(0)
+    expect(heartbeat.hasMore).toBe(true)
+    // No processedCount key: it adds nothing to the engine's running total.
+    expect(heartbeat.processedCount).toBeUndefined()
+    // Unchanged cursor — the idle, no-watermark start state, re-persisted verbatim.
+    expect(parseCursor(heartbeat.cursor)).toEqual({ kind: 'idle', updatedAfter: null })
+    // The product still imported once the download was released.
+    expect(actionsFor(batches, PRODUCT_1.id)).toEqual(['create'])
+  })
+
+  it('beats during the full-sync reconcile sweep and still carries the reconcile items', async () => {
+    // First run: import P1 and P2 so both become owned rows the sweep will consider.
+    const first = makeHarness({
+      jsonl: [jsonl(PRODUCT_1, [VARIANT_A]), jsonl(PRODUCT_2, [])].join('\n'),
+    })
+    await collect(first)
+
+    // Second FULL run exports only P2, so the sweep must deactivate P1. A `now` that jumps a full
+    // interval per call makes every owned id due for a beat, deterministically and without timers.
+    const intervalMs = 15_000
+    let ticks = 0
+    const second = makeHarness({ jsonl: jsonl(PRODUCT_2, []) }, first, {
+      heartbeatIntervalMs: intervalMs,
+      now: () => ticks++ * intervalMs,
+    })
+    const batches = await collect(second)
+
+    const reconcileBeats = batches.filter(
+      (b) => b.items.length === 0 && typeof b.message === 'string' && b.message.includes('checked'),
+    )
+    expect(reconcileBeats.length).toBeGreaterThanOrEqual(1)
+    for (const beat of reconcileBeats) {
+      expect(beat.hasMore).toBe(true)
+      expect(beat.processedCount).toBeUndefined()
+    }
+
+    // The terminal reconcile batch still carries the deactivation item, and P1 is deactivated.
+    const terminal = batches[batches.length - 1]!
+    expect(terminal.message).toBe('Reconciling Shopify products after the final batch')
+    expect(terminal.items.find((i) => i.externalId === PRODUCT_1.id)).toMatchObject({
+      data: { reason: 'absent_from_shopify_full_sync' },
+    })
+    expect(rowOf(second, 'catalog_product', PRODUCT_1.id).isActive).toBe(false)
+  })
+
+  it('sums per-batch processedCount to the true product count, with no cumulative inflation', async () => {
+    // Two products across three data batches (batchSize 1 ⇒ P1, P2, then the empty tail page).
+    const h = makeHarness({ jsonl: [jsonl(PRODUCT_1, [VARIANT_A]), jsonl(PRODUCT_2, [])].join('\n') })
+    const batches = await collect(h, { batchSize: 1 })
+
+    const total = batches.reduce((sum, b) => sum + (b.processedCount ?? 0), 0)
+    expect(total).toBe(2)
+    // The terminal reconcile batch contributes nothing to the count.
+    expect(batches[batches.length - 1]!.processedCount).toBeUndefined()
   })
 })

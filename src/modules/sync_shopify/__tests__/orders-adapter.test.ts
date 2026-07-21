@@ -1,7 +1,7 @@
 import type { ImportBatch, StreamImportInput } from '@open-mercato/core/modules/data_sync/lib/adapter'
 import type { BulkExport, BulkNode } from '../lib/bulk'
 import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../lib/client'
-import { COMMAND, COMMAND_RESULT_KEY, ENTITY_TYPE, INTEGRATION_ID, MAPPING_ENTITY_TYPE, PROVIDER_KEY } from '../lib/constants'
+import { COMMAND, COMMAND_RESULT_KEY, ENTITY_TYPE, INTEGRATION_ID, MAPPING_ENTITY_TYPE, OM_ENTITY_ID, PROVIDER_KEY } from '../lib/constants'
 import { parseCursor, serializeCursor } from '../lib/cursor'
 import { createEntityWriter, type CommandBusPort, type EntityRow, type FindOnePort } from '../lib/writer'
 import {
@@ -18,6 +18,7 @@ import {
   type OrderSyncRuntime,
 } from '../lib/adapters/orders'
 import type { ShopifyMoneyBag, ShopifyOrderLine, ShopifyOrderNode } from '../lib/mappers/order'
+import type { HeartbeatClock } from '../lib/heartbeat'
 
 // The framework is stubbed but the WRITER IS REAL: the order result key (`orderId`), the
 // mapping-first/natural-key resolution, and the content-hash skip all live inside the writer, so
@@ -267,6 +268,172 @@ function deltaHarness(pages: ShopifyOrderNode[][], opts: { extensions?: Record<s
 function items(batches: ImportBatch[]) {
   return batches.flatMap((b) => b.items) as { action: string; externalId: string; data: Record<string, unknown> }[]
 }
+
+// ── Heartbeat test doubles ──────────────────────────────────────────────────────────────────
+
+/** A promise whose settlement the test controls, for holding the bulk export open mid-run. */
+function makeDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+/** A `HeartbeatClock` whose bulk-poll timers fire only when the test says so. */
+function makeFakeHeartbeatClock() {
+  type Timer = { cb: () => void; dead: boolean }
+  const timers: Timer[] = []
+  const clock: HeartbeatClock = {
+    setTimer: (_ms, cb) => {
+      const timer: Timer = { cb, dead: false }
+      timers.push(timer)
+      return () => {
+        timer.dead = true
+      }
+    },
+  }
+  return {
+    clock,
+    /** Fire the most recent live timer, mimicking one interval elapsing. */
+    fireNext(): boolean {
+      for (let i = timers.length - 1; i >= 0; i -= 1) {
+        if (!timers[i].dead) {
+          timers[i].dead = true
+          timers[i].cb()
+          return true
+        }
+      }
+      return false
+    },
+  }
+}
+
+/** Hop the macrotask boundary so the adapter generator reaches its next await/yield. */
+const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+async function drainBatches(iterator: AsyncIterator<ImportBatch>): Promise<ImportBatch[]> {
+  const out: ImportBatch[] = []
+  for (;;) {
+    const result = await iterator.next()
+    if (result.done) break
+    out.push(result.value)
+  }
+  return out
+}
+
+describe('liveness heartbeats', () => {
+  it('beats while the bulk export is still running, before the first data batch', async () => {
+    const harness = makeHarness()
+    const work = makeDeferred<BulkExport>()
+    const fake = makeFakeHeartbeatClock()
+    const adapter = createOrdersAdapter({
+      createRuntime: async () => harness.runtime,
+      // Held open until the test resolves it, so the poll phase is observably in progress.
+      bulkExport: () => work.promise,
+      heartbeatClock: fake.clock,
+    })
+
+    const iterator = adapter.streamImport!(importInput())[Symbol.asyncIterator]()
+
+    // First pull: the export has not resolved, so an empty heartbeat must arrive first.
+    const firstPull = iterator.next()
+    await flushAsync() // let the generator arm its heartbeat timer
+    expect(fake.fireNext()).toBe(true)
+    const beat = await firstPull
+
+    expect(beat.done).toBe(false)
+    expect(beat.value.items).toEqual([]) // empty — no created/updated/skipped/failed delta
+    expect('processedCount' in beat.value).toBe(false) // adds 0 to the engine total
+    // The heartbeat carried the pre-export cursor unchanged (nothing to resume into mid-poll).
+    expect(beat.value.cursor).toBe(serializeCursor({ kind: 'idle', updatedAfter: null }))
+
+    // Let the export finish; the remainder of the run carries the real order. The stub ignores its
+    // arguments, but its type declares them, so pass the client + query through.
+    work.resolve(await bulkExportOf([toOrderBulkNode(orderNode())])(harness.runtime.client, buildOrderBulkQuery()))
+    const rest = await drainBatches(iterator)
+
+    const dataItems = rest.flatMap((b) => b.items) as { action: string; externalId: string }[]
+    expect(dataItems).toHaveLength(1)
+    expect(dataItems[0]).toMatchObject({ action: 'create', externalId: 'gid://shopify/Order/5001' })
+  })
+
+  it('a fast-resolving bulk export yields NO heartbeat, so existing sequences are unchanged', async () => {
+    const harness = makeHarness()
+    const fake = makeFakeHeartbeatClock()
+    const batches = await collect(
+      createOrdersAdapter({
+        createRuntime: async () => harness.runtime,
+        bulkExport: bulkExportOf([toOrderBulkNode(orderNode())]),
+        heartbeatClock: fake.clock,
+      }).streamImport!(importInput()),
+    )
+    // The stubbed export settles on a microtask — long before any interval — so the timer is
+    // cancelled unfired and no empty heartbeat batch enters the stream.
+    const heartbeats = batches.filter((b) => b.items.length === 0 && /rows scanned/.test(b.message ?? ''))
+    expect(heartbeats).toHaveLength(0)
+    expect(fake.fireNext()).toBe(false)
+  })
+
+  it('beats during the reconcile sweep, and still emits the terminal reconcile batch', async () => {
+    let clock = 0
+    const harness = makeHarness({
+      // Three owned ids the full run did not see, so the sweep walks all of them.
+      ownedOrders: ['order-a', 'order-b', 'order-c'],
+      ownership: {}, // none owned → all skipped, but the sweep still walks every id
+    })
+    const adapter = createOrdersAdapter({
+      createRuntime: async () => harness.runtime,
+      bulkExport: bulkExportOf([toOrderBulkNode(orderNode())]),
+      heartbeatIntervalMs: 100,
+      // Advances well past the interval on every call, so each swept id is "due".
+      now: () => (clock += 1_000),
+    })
+
+    // A full window is the second guard that lets a full run reconcile at all.
+    const batches = await collect(
+      adapter.streamImport!(importInput({ credentials: { orderHistoryWindow: 'full' } })),
+    )
+
+    const reconcileBeats = batches.filter(
+      (b) => b.items.length === 0 && (b.message ?? '').includes('checked'),
+    )
+    expect(reconcileBeats.length).toBeGreaterThanOrEqual(1)
+    reconcileBeats.forEach((b) => expect('processedCount' in b).toBe(false))
+
+    const last = batches[batches.length - 1]
+    expect(last.hasMore).toBe(false)
+    expect(last.message).toBe('Reconciling Shopify orders after the final batch')
+    expect(last.refreshCoverageEntityTypes).toEqual([OM_ENTITY_ID.salesOrder])
+    // The terminal reconcile batch reports 0 processed — its soft-deletes are not source orders.
+    expect(last.processedCount).toBe(0)
+  })
+
+  it('reports processedCount as a per-batch delta that sums to the true order count', async () => {
+    const harness = makeHarness()
+    // Five distinct orders; the backfill carries no children, so each is exactly one item.
+    const nodes = [1, 2, 3, 4, 5].map((n) => orderNode({ id: `gid://shopify/Order/${n}`, name: `#100${n}` }))
+
+    // batchSize 2 over 5 orders → the backfill emits data batches of 2, 2, then 1.
+    const batches = await collect(
+      createOrdersAdapter({
+        createRuntime: async () => harness.runtime,
+        bulkExport: bulkExportOf(nodes.map(toOrderBulkNode)),
+      }).streamImport!(importInput({ batchSize: 2 })),
+    )
+
+    // The engine SUMS processedCount across batches; a per-batch delta must total the real count
+    // exactly, with no triangular inflation from a running cumulative.
+    const totalProcessed = batches.reduce((sum, b) => sum + (b.processedCount ?? 0), 0)
+    expect(totalProcessed).toBe(5)
+
+    for (const b of batches) {
+      if (b.items.length > 0) expect(b.processedCount).toBe(b.items.length)
+    }
+  })
+})
 
 // ── Adapter shape ────────────────────────────────────────────────────────────────────────────
 
