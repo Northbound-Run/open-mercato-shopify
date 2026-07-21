@@ -84,9 +84,15 @@ release, and an already-installed app must re-approve them.
 > window-limited and reconciles only within that window. If you need full order history (for example
 > for demand planning), request `read_all_orders` on the app.
 
-### 3. Enter the credentials
+### 3. Connect the store
 
-In the Open Mercato admin, go to **Settings → Integrations → Shopify** and enter:
+The connection is resolved **env-first at runtime**: each field falls back to its
+`OM_INTEGRATION_SHOPIFY_*` env var, with the stored credential (if any) taking precedence as a
+per-tenant override. So a headless deployment just sets the [environment
+variables](#environment-variables) — tenant bootstrap seeds the same values into the store, and the
+connection works without touching the admin UI.
+
+To connect (or override) in the admin instead, go to **Settings → Integrations → Shopify** and enter:
 
 | Field | Value |
 |---|---|
@@ -215,11 +221,13 @@ yarn probe --shop yourstore.myshopify.com --client-id <id> --client-secret shpss
 
 ## Environment variables
 
-All optional — credentials are normally entered in the admin UI. These let a single-store deployment
-preconfigure itself from configuration management: tenant bootstrap (`setup.ts`) applies them
-automatically on tenant creation, and `configure-from-env` re-applies the same logic later. Every
-step is **non-destructive** — existing credentials, operator-toggled integrations and existing
-schedules are all left untouched, so a redeploy never clobbers an operator's choices.
+All optional. The **connection** (`SHOP_DOMAIN` / `CLIENT_ID` / `CLIENT_SECRET` / `API_VERSION`) is
+resolved **env-first at runtime** — a stored credential wins as a per-tenant override, otherwise the
+env var is used — so a single-store deployment connects straight from configuration management
+without touching the admin UI. Tenant bootstrap (`setup.ts`) also seeds these into the credential
+store on tenant creation, and `configure-from-env` re-applies the same logic (plus enable/schedule)
+later. Every step is **non-destructive** — existing credentials, operator-toggled integrations and
+existing schedules are all left untouched, so a redeploy never clobbers an operator's choices.
 
 | Variable | Purpose |
 |---|---|

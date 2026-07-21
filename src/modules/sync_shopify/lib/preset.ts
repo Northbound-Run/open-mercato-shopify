@@ -117,6 +117,54 @@ export async function applyShopifyCredentialsPreset(input: {
   return 'applied'
 }
 
+// ── Runtime connection resolution (env-first) ────────────────────────────────────────────────────
+
+export type ShopifyConnection = {
+  shopDomain: string
+  clientId: string
+  clientSecret: string
+  apiVersion: string
+}
+
+/**
+ * Resolve the Shopify connection env-first: a stored credential field wins when present, otherwise
+ * fall back to the matching `OM_INTEGRATION_SHOPIFY_*` env var. This mirrors the sync-google-sheets
+ * pattern — env is the working default, the credential store is an optional per-tenant override — so
+ * an env-driven deployment connects even when the store is empty or only partially populated.
+ *
+ * `shopDomain` is normalized here so the token URL and the client agree; an invalid env host is left
+ * as-is rather than thrown, so a bad env value never crashes the caller — `createShopifyClient`
+ * rejects a foreign/empty host loudly at build time instead.
+ */
+export function resolveConnectionCredentials(
+  credentials: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): ShopifyConnection {
+  const pick = (key: string, envKey: string): string => {
+    const stored = credentials[key]
+    if (typeof stored === 'string' && stored.trim()) return stored.trim()
+    const fromEnv = env[envKey]
+    return typeof fromEnv === 'string' ? fromEnv.trim() : ''
+  }
+
+  const rawShopDomain = pick('shopDomain', ENV_KEYS.shopDomain)
+  let shopDomain = rawShopDomain
+  if (rawShopDomain) {
+    try {
+      shopDomain = normalizeShopDomain(rawShopDomain)
+    } catch {
+      shopDomain = rawShopDomain
+    }
+  }
+
+  return {
+    shopDomain,
+    clientId: pick('clientId', ENV_KEYS.clientId),
+    clientSecret: pick('clientSecret', ENV_KEYS.clientSecret),
+    apiVersion: pick('apiVersion', ENV_KEYS.apiVersion) || DEFAULT_API_VERSION,
+  }
+}
+
 // ── Data-sync bootstrap (enable + schedule) ─────────────────────────────────────────────────────
 
 /**

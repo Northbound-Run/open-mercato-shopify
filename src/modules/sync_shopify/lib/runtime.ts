@@ -12,7 +12,8 @@ import {
 } from './writer'
 import { createShopifyClient, type ShopifyClient } from './client'
 import { createTokenProvider } from './token'
-import { DEFAULT_API_VERSION, INTEGRATION_ID, MAPPING_ENTITY_TYPE } from './constants'
+import { INTEGRATION_ID, MAPPING_ENTITY_TYPE } from './constants'
+import { resolveConnectionCredentials } from './preset'
 import type { ProductsMappingPort, ProductsRuntime } from './adapters/products'
 import type { CategoryAssignmentPort, CollectionsRunContext } from './adapters/collections'
 import type { CustomerSyncRuntime } from './adapters/customers'
@@ -148,19 +149,17 @@ function stringField(value: unknown): string | null {
 /**
  * Build a Shopify client from a connection's credentials. Shared by all four adapters.
  *
- * `createShopifyClient` normalises the shop domain eagerly and throws on an empty or foreign host, so
- * a misconfigured connection fails loudly here rather than POSTing a client secret somewhere unsafe.
- * No `userId` is read or set — credentials are tenant-wide (trap 3).
+ * Credentials are resolved env-first (`resolveConnectionCredentials`): a stored field wins, else the
+ * `OM_INTEGRATION_SHOPIFY_*` env var — so an env-driven deployment connects even when the store is
+ * empty or partial. `createShopifyClient` then normalises the shop domain eagerly and throws on an
+ * empty or foreign host, so a misconfigured connection fails loudly here rather than POSTing a client
+ * secret somewhere unsafe. No `userId` is read or set — credentials are tenant-wide (trap 3).
  */
-export function createShopifyClientFromCredentials(credentials: Record<string, unknown>): ShopifyClient {
-  const shopDomain = typeof credentials.shopDomain === 'string' ? credentials.shopDomain : ''
-  const clientId = typeof credentials.clientId === 'string' ? credentials.clientId : ''
-  const clientSecret = typeof credentials.clientSecret === 'string' ? credentials.clientSecret : ''
-  const apiVersion =
-    typeof credentials.apiVersion === 'string' && credentials.apiVersion.trim()
-      ? credentials.apiVersion.trim()
-      : DEFAULT_API_VERSION
-
+export function createShopifyClientFromCredentials(
+  credentials: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): ShopifyClient {
+  const { shopDomain, clientId, clientSecret, apiVersion } = resolveConnectionCredentials(credentials, env)
   const tokenProvider = createTokenProvider({ shopDomain, clientId, clientSecret })
   return createShopifyClient({ shopDomain, tokenProvider, apiVersion })
 }

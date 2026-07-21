@@ -1,6 +1,7 @@
 import type { IntegrationScope } from '@open-mercato/shared/modules/integrations/types'
 import { createShopifyClient, ShopifyApiError } from './client'
-import { DEFAULT_API_VERSION, REQUIRED_SCOPES } from './constants'
+import { REQUIRED_SCOPES } from './constants'
+import { resolveConnectionCredentials } from './preset'
 import { missingScopes, orderHistoryWindow, ShopifyAuthError } from './shop-domain'
 import { createTokenProvider } from './token'
 
@@ -46,13 +47,9 @@ export const shopifyHealthCheck = {
     credentials: Record<string, unknown> | null,
     _scope: IntegrationScope,
   ): Promise<HealthCheckResult> {
-    const str = (key: string): string =>
-      typeof credentials?.[key] === 'string' ? (credentials[key] as string).trim() : ''
-
-    const shopDomain = str('shopDomain')
-    const clientId = str('clientId')
-    const clientSecret = str('clientSecret')
-    const apiVersion = str('apiVersion') || DEFAULT_API_VERSION
+    // Env-first: a stored field wins, else the OM_INTEGRATION_SHOPIFY_* env var — so health reflects
+    // the same connection the sync runtime uses, even on a store that was never populated via the UI.
+    const { shopDomain, clientId, clientSecret, apiVersion } = resolveConnectionCredentials(credentials ?? {})
 
     const missingConfig = [
       !shopDomain && 'shopDomain',

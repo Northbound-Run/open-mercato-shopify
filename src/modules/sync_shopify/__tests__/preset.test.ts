@@ -9,8 +9,9 @@ import {
   parseEnableEntities,
   readShopifyDataSyncBootstrap,
   readShopifyEnvPreset,
+  resolveConnectionCredentials,
 } from '../lib/preset'
-import { ENTITY_TYPE, INTEGRATION_ID } from '../lib/constants'
+import { BUNDLE_ID, DEFAULT_API_VERSION, ENTITY_TYPE, INTEGRATION_ID } from '../lib/constants'
 
 const SCOPE: IntegrationScope = { organizationId: 'org-1', tenantId: 'tenant-1' }
 
@@ -95,6 +96,61 @@ function makeContainer(registrations: Record<string, unknown>) {
   }
   return { container: container as unknown as AwilixContainer, resolveCalls }
 }
+
+// ── Connection identity + env-first resolution ───────────────────────────────────────────────────
+
+describe('bundle identity', () => {
+  it('anchors the bundle to the primary Products integration', () => {
+    // The framework resolves the bundle-config page and shared credentials via getIntegration(bundleId),
+    // so the bundle id must be a real integration id — otherwise the config page 404s.
+    expect(BUNDLE_ID).toBe(INTEGRATION_ID.products)
+  })
+})
+
+describe('resolveConnectionCredentials', () => {
+  const SHOP_ENV = {
+    [ENV_KEYS.shopDomain]: 'envstore.myshopify.com',
+    [ENV_KEYS.clientId]: 'env-client',
+    [ENV_KEYS.clientSecret]: 'shpss_env',
+    [ENV_KEYS.apiVersion]: '2026-04',
+  }
+
+  it('reads the whole connection from env when the store is empty', () => {
+    expect(resolveConnectionCredentials({}, SHOP_ENV)).toEqual({
+      shopDomain: 'envstore.myshopify.com',
+      clientId: 'env-client',
+      clientSecret: 'shpss_env',
+      apiVersion: '2026-04',
+    })
+  })
+
+  it('lets a stored field win over env (store is the override)', () => {
+    const resolved = resolveConnectionCredentials({ clientSecret: 'shpss_stored' }, SHOP_ENV)
+    expect(resolved.clientSecret).toBe('shpss_stored') // store wins
+    expect(resolved.clientId).toBe('env-client') // env fills the rest
+  })
+
+  it('treats a blank stored field as absent and falls back to env', () => {
+    expect(resolveConnectionCredentials({ clientId: '   ' }, SHOP_ENV).clientId).toBe('env-client')
+  })
+
+  it('defaults the api version when neither store nor env sets it', () => {
+    expect(resolveConnectionCredentials({}, {}).apiVersion).toBe(DEFAULT_API_VERSION)
+  })
+
+  it('normalizes the shop domain from env', () => {
+    expect(
+      resolveConnectionCredentials({}, { [ENV_KEYS.shopDomain]: 'https://EnvStore.myshopify.com/admin' })
+        .shopDomain,
+    ).toBe('envstore.myshopify.com')
+  })
+
+  it('does not throw on an invalid env shop domain — leaves it for the client to reject', () => {
+    const bad = { [ENV_KEYS.shopDomain]: 'evil.com' }
+    expect(() => resolveConnectionCredentials({}, bad)).not.toThrow()
+    expect(resolveConnectionCredentials({}, bad).shopDomain).toBe('evil.com')
+  })
+})
 
 // ── Pure parsers ───────────────────────────────────────────────────────────────────────────────
 
