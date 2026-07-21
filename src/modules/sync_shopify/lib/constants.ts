@@ -120,8 +120,6 @@ export const COMMAND_RESULT_KEY = {
 // `providerKey` is the join to the sync engine: it resolves an adapter via
 // `getIntegration(integrationId)?.providerKey ?? integrationId`, so each IntegrationDefinition's
 // providerKey MUST equal its adapter's providerKey.
-export const BUNDLE_ID = 'sync_shopify'
-
 export const INTEGRATION_ID = {
   products: 'sync_shopify_products',
   collections: 'sync_shopify_collections',
@@ -129,6 +127,15 @@ export const INTEGRATION_ID = {
   orders: 'sync_shopify_orders',
   inventory: 'sync_shopify_inventory',
 } as const
+
+// The bundle is the shared Shopify connection — one set of credentials for all five integrations.
+// Its id MUST equal a real integration id: the framework's bundle-config page and its shared-credential
+// resolution both go through `getIntegration(bundleId)`, which returns nothing for a standalone bundle
+// id (that is the "Integration not found" 404). So the bundle is anchored to the primary Products
+// integration — Products owns the connection credentials directly and the other four inherit them via
+// `bundleId` fall-through. (Changed from the standalone 'sync_shopify' in 0.2.1; this re-keys the
+// stored credential row, so re-run `configure-from-env` after upgrading.)
+export const BUNDLE_ID = INTEGRATION_ID.products
 
 export const PROVIDER_KEY = {
   products: 'shopify_products',
