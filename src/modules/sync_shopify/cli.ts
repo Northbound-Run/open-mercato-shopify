@@ -5,7 +5,13 @@ import {
   INVENTORY_DAILY_RETENTION_DAYS,
 } from './lib/constants'
 import { formatProbeResult, probeConnection } from './lib/probe'
-import { applyShopifyEnvPreset, ENV_KEYS } from './lib/preset'
+import {
+  applyShopifyEnvPreset,
+  ENV_KEYS,
+  readShopifyDataSyncBootstrap,
+  type ShopifyDataSyncBootstrap,
+  type ShopifyPresetResult,
+} from './lib/preset'
 import { addDays, snapshotDateFor } from './lib/inventory-history'
 
 /**
@@ -143,6 +149,44 @@ const testConnection: ModuleCli = {
   },
 }
 
+/** Human-readable summary of what `configure-from-env` did (and deliberately did not) change. */
+function reportPresetOutcome(result: ShopifyPresetResult, bootstrap: ShopifyDataSyncBootstrap): void {
+  const list = (xs: readonly string[]) => (xs.length ? xs.join(', ') : '—')
+  const line = (label: string, value: string) => console.log(`    ${label.padEnd(16)}${value}`)
+
+  console.log('')
+  line(
+    'Credentials',
+    result.credentials === 'applied'
+      ? 'seeded from environment'
+      : 'unchanged (already present or not set)',
+  )
+  line('Enabled', list(result.enabled))
+  if (result.enableSkipped.length) line('Already set', result.enableSkipped.join(', '))
+
+  if (bootstrap.syncCron !== null || bootstrap.inventoryCron !== null) {
+    line('Scheduled', list(result.scheduled))
+    if (result.scheduleExisting.length) line('Sched. exists', result.scheduleExisting.join(', '))
+    if (bootstrap.syncCron) line('  delta cron', bootstrap.syncCron)
+    if (bootstrap.inventoryCron) line('  inventory cron', bootstrap.inventoryCron)
+  }
+
+  const warnings: string[] = []
+  if (result.unknownEntities.length)
+    warnings.push(`ignored unknown ${ENV_KEYS.enableEntities} value(s): ${result.unknownEntities.join(', ')}`)
+  for (const cron of result.cronRejected) warnings.push(`ignored malformed sync cron: "${cron}"`)
+  if (result.schedulerUnavailable)
+    warnings.push('a sync cron is set but the scheduler module is not installed — no schedules created')
+  for (const warning of warnings) console.log(`  ! ${warning}`)
+
+  const nothingChanged =
+    result.credentials === 'skipped' && !result.enabled.length && !result.scheduled.length
+  if (nothingChanged && !warnings.length) {
+    console.log(`  - Nothing to do (set ${ENV_KEYS.shopDomain} and/or ${ENV_KEYS.enableEntities}).`)
+  }
+  console.log('')
+}
+
 const configureFromEnv: ModuleCli = {
   command: 'configure-from-env',
   async run(argv) {
@@ -158,15 +202,11 @@ const configureFromEnv: ModuleCli = {
     const { createRequestContainer } = await import('@open-mercato/shared/lib/di/container')
     const container = await createRequestContainer()
     try {
-      const outcome = await applyShopifyEnvPreset({
+      const result = await applyShopifyEnvPreset({
         container: container as never,
         scope: { organizationId, tenantId },
       })
-      console.log(
-        outcome === 'applied'
-          ? '\n  ✓ Credentials seeded from environment.\n'
-          : `\n  - Nothing to do (no ${ENV_KEYS.shopDomain} set, or credentials already present).\n`,
-      )
+      reportPresetOutcome(result, readShopifyDataSyncBootstrap(process.env))
     } catch (error) {
       console.error(`\n  ✗ ${error instanceof Error ? error.message : String(error)}\n`)
       process.exitCode = 1
@@ -278,7 +318,22 @@ sync_shopify — Shopify sync for Open Mercato
       ${ENV_KEYS.clientSecret} when flags are omitted.
 
   yarn mercato sync_shopify configure-from-env --tenant <id> --org <id>
-      Seed stored credentials from environment variables. Never overwrites existing values.
+      Apply the provider-owned env preconfiguration: seed stored credentials, and — when the
+      deployment opts in — enable integrations and seed recurring import schedules. Every step is
+      non-destructive: existing credentials, operator-toggled integrations and existing schedules
+      are all left untouched.
+
+      ${ENV_KEYS.enableEntities}=products,collections,customers,orders,inventory (or 'all' / 'none')
+          Enables the named syncs. Defaults to 'all' when a shop domain is configured via env; set
+          'none' to opt out.
+      ${ENV_KEYS.syncCron}='0 * * * *'
+          Seeds an incremental import schedule for each enabled delta sync — products, collections,
+          customers, orders (needs @open-mercato/scheduler).
+      ${ENV_KEYS.inventoryCron}='0 2 * * *'
+          Seeds the daily inventory snapshot schedule. Separate knob because inventory captures one
+          snapshot per day; without it, inventory is enabled but not auto-scheduled.
+      ${ENV_KEYS.syncTimezone}=UTC
+          Timezone for the seeded schedules. Defaults to UTC.
 
   yarn mercato sync_shopify prune-inventory --tenant <id> --org <id> [flags]
       Delete inventory snapshot rows older than the retention window. Nothing prunes

@@ -215,9 +215,11 @@ yarn probe --shop yourstore.myshopify.com --client-id <id> --client-secret shpss
 
 ## Environment variables
 
-All optional — credentials are normally entered in the admin UI. These seed a single-store
-deployment from configuration management via `configure-from-env`, and never overwrite existing
-values.
+All optional — credentials are normally entered in the admin UI. These let a single-store deployment
+preconfigure itself from configuration management: tenant bootstrap (`setup.ts`) applies them
+automatically on tenant creation, and `configure-from-env` re-applies the same logic later. Every
+step is **non-destructive** — existing credentials, operator-toggled integrations and existing
+schedules are all left untouched, so a redeploy never clobbers an operator's choices.
 
 | Variable | Purpose |
 |---|---|
@@ -225,7 +227,26 @@ values.
 | `OM_INTEGRATION_SHOPIFY_CLIENT_ID` | app client ID |
 | `OM_INTEGRATION_SHOPIFY_CLIENT_SECRET` | app client secret (`shpss_…`) |
 | `OM_INTEGRATION_SHOPIFY_API_VERSION` | optional; defaults to `2026-07` |
+| `OM_INTEGRATION_SHOPIFY_ENABLE_ENTITIES` | optional; comma list of `products,collections,customers,orders,inventory` (or `all` / `none`). **Unset defaults to `all` when a shop domain is configured via env** |
+| `OM_INTEGRATION_SHOPIFY_SYNC_CRON` | optional; cron (e.g. `0 * * * *`) to seed an incremental import schedule for each enabled **delta** sync (products, collections, customers, orders) — needs `@open-mercato/scheduler` |
+| `OM_INTEGRATION_SHOPIFY_SYNC_CRON_INVENTORY` | optional; separate cron (e.g. `0 2 * * *`) for the daily inventory snapshot |
+| `OM_INTEGRATION_SHOPIFY_SYNC_TIMEZONE` | optional; timezone for seeded schedules, defaults to `UTC` |
 | `TENANT_DATA_ENCRYPTION_FALLBACK_KEY` | framework credential-encryption key (or configure Vault KMS) |
+
+When the connection is configured via env (`OM_INTEGRATION_SHOPIFY_SHOP_DOMAIN` is set), a fresh
+tenant **enables all five syncs by default** — the deployment already knows the credentials, so no
+admin toggling is needed. Set `OM_INTEGRATION_SHOPIFY_ENABLE_ENTITIES=none` to opt out, or name a
+subset. A plain install with no Shopify env enables nothing (integrations stay disabled until an
+admin turns them on), so nothing is ever enabled without a connection behind it. The cron variables
+only take effect for entities that end up enabled, and are silently skipped when the scheduler module
+is absent.
+
+**Inventory** is a snapshot job, not a delta sync: every run captures the current day (there is no
+cursor), so give it its own daily cadence via `OM_INTEGRATION_SHOPIFY_SYNC_CRON_INVENTORY` rather than
+the hourly delta cron — running it hourly just re-captures the same day. It also links snapshots to
+catalog variants (and writes `unit_cost` / out-of-stock ratio) through the **Products** sync's
+external-id mappings, so keep Products enabled and synced alongside it; before Products has run, a
+snapshot is still recorded but its local variant link resolves on a later run.
 
 ---
 

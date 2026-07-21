@@ -18,7 +18,9 @@ export const setup: ModuleSetupConfig = {
   },
 
   /**
-   * Seeds credentials from environment variables for single-store deployments.
+   * Seeds credentials — and, when the deployment opts in, enables and schedules the syncs — from
+   * environment variables for single-store deployments. See `lib/preset.ts` for the env keys and the
+   * non-destructive semantics.
    *
    * Deliberately swallows its own failures: a misconfigured optional preset must never abort
    * tenant creation. This mirrors sync-akeneo's `seedDefaults`, which logs a warning through the
@@ -26,10 +28,41 @@ export const setup: ModuleSetupConfig = {
    */
   async seedDefaults(ctx) {
     try {
-      await applyShopifyEnvPreset({
+      const result = await applyShopifyEnvPreset({
         container: ctx.container,
         scope: { organizationId: ctx.organizationId, tenantId: ctx.tenantId },
       })
+
+      const changes: string[] = []
+      if (result.credentials === 'applied') changes.push('credentials')
+      if (result.enabled.length) changes.push(`enabled ${result.enabled.join('/')}`)
+      if (result.scheduled.length) changes.push(`scheduled ${result.scheduled.join('/')}`)
+      if (changes.length) {
+        // eslint-disable-next-line no-console
+        console.log(`[sync_shopify] env preset applied: ${changes.join('; ')}`)
+      }
+
+      // Surface silent no-ops that an operator almost certainly did not intend.
+      if (result.unknownEntities.length) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[sync_shopify] ignored unknown ${'OM_INTEGRATION_SHOPIFY_ENABLE_ENTITIES'} value(s): ${result.unknownEntities.join(', ')}`,
+        )
+      }
+      if (result.cronRejected.length) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[sync_shopify] ignored malformed sync cron value(s): ${result.cronRejected
+            .map((cron) => `"${cron}"`)
+            .join(', ')}`,
+        )
+      }
+      if (result.schedulerUnavailable) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[sync_shopify] OM_INTEGRATION_SHOPIFY_SYNC_CRON set but the scheduler module is not installed — no schedules were created.',
+        )
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       // eslint-disable-next-line no-console
