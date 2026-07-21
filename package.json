@@ -6,10 +6,10 @@
   "main": "./dist/index.js",
   "license": "MIT",
   "author": "Northbound",
-  "homepage": "https://github.com/northbound-run/open-mercato-shopify",
+  "homepage": "https://github.com/Northbound-Run/open-mercato-shopify",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/northbound-run/open-mercato-shopify.git"
+    "url": "git+https://github.com/Northbound-Run/open-mercato-shopify.git"
   },
   "keywords": [
     "open-mercato",
