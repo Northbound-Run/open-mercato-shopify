@@ -135,6 +135,16 @@ export const integrations: IntegrationDefinition[] = [
     'Shopify — Orders',
     'Imports orders, line items, addresses and payments. Limited to the last 60 days unless the app holds read_all_orders.',
   ),
+  // Inventory shares the bundle connection but is a snapshot job, not a delta sync: it has no cursor
+  // (every run captures the current day) and writes to its own table, so schedule it daily rather
+  // than on the hourly delta cadence. It resolves catalog variant links from the Products sync's
+  // external-id mappings, so keep Products enabled alongside it.
+  syncIntegration(
+    INTEGRATION_ID.inventory,
+    PROVIDER_KEY.inventory,
+    'Shopify — Inventory',
+    'Imports a daily stock snapshot per variant and location, for demand-planning corrections.',
+  ),
 ]
 
 // The Open Mercato module-registry generator references a *singular* `integration`
