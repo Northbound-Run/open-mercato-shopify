@@ -137,4 +137,12 @@ export const integrations: IntegrationDefinition[] = [
   ),
 ]
 
+// The Open Mercato module-registry generator references a *singular* `integration`
+// export as a fallback (its generated `integrations ?? integration` shim) for modules
+// that define exactly one integration. This module ships several (see `integrations`
+// above), so also expose the primary one under the singular name — otherwise the
+// generated registry's static `.integration` reference fails to resolve under strict
+// bundlers (Turbopack) and Next's build-time type-check, breaking consumers' builds.
+export const integration: IntegrationDefinition = integrations[0]
+
 export default integrations
