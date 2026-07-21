@@ -284,7 +284,13 @@ const LINE_SELECTION = `
       taxLines { title ratePercentage priceSet ${MONEY_BAG} }
       discountAllocations { allocatedAmountSet ${MONEY_BAG} }`
 
-const SHIPPING_SELECTION = `title originalPriceSet ${MONEY_BAG} taxLines { title priceSet ${MONEY_BAG} }`
+// `id` is REQUIRED, not cosmetic: in the bulk export `shippingLines` is a connection
+// (`ShippingLineConnection`), so each line arrives as its OWN JSONL record, and the reassembler
+// keys a child to its parent by the type segment of its GID. A shipping line selected without `id`
+// reassembles as an id-less line, which the reassembler rejects as `missing_id` — failing the whole
+// export. The delta path nests these under the order so it never needed the id, which is exactly how
+// the omission survived. `ShippingLine` implements Node, so the field is available on both paths.
+const SHIPPING_SELECTION = `id title originalPriceSet ${MONEY_BAG} taxLines { title priceSet ${MONEY_BAG} }`
 
 /**
  * Backfill document.

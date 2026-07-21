@@ -109,6 +109,9 @@ export type ShopifyOrderLine = {
 }
 
 export type ShopifyShippingLine = {
+  /** Selected so the bulk export's flattened `ShippingLine` line carries a GID to key on — see
+   *  `SHIPPING_SELECTION`. Not otherwise mapped. */
+  id?: string | null
   title?: string | null
   originalPriceSet?: ShopifyMoneyBag | null
   priceSet?: ShopifyMoneyBag | null

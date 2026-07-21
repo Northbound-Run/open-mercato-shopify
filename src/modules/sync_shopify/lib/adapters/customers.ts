@@ -483,11 +483,28 @@ function failedItem(externalId: string, stage: string, detail?: string | null): 
 
 // ── Address writing ──────────────────────────────────────────────────────────────────────────
 
+/**
+ * Build the input for `customers.addresses.{create,update}`.
+ *
+ * ⚠️ Core types every optional address field as `.optional()` but NOT `.nullable()` (see
+ * `addressCreateSchema`), so a `null` is an `invalid_type` REJECT — not an accepted "clear" — and
+ * takes the whole customer down at the address stage. The mapper resolves an absent Shopify field
+ * to `null`, and Shopify omits company and the second line for almost every address, so a naive
+ * `{ companyName: address.companyName }` fails nearly every customer that has an address.
+ *
+ * The nullable fields are therefore OMITTED when null rather than sent: the schema accepts an
+ * absent key, and both commands then store it as null (`parsed.x ?? null` on create, `x !==
+ * undefined` guards the update). `addressLine1` is guaranteed non-empty by the mapper and
+ * `isPrimary` is always a boolean, so both are always present.
+ */
 function addressInput(address: MappedAddress, scope: TenantScope): Record<string, unknown> {
-  return {
+  const input: Record<string, unknown> = {
     organizationId: scope.organizationId,
     tenantId: scope.tenantId,
     addressLine1: address.addressLine1,
+    isPrimary: address.isPrimary,
+  }
+  const optional: Record<string, string | null> = {
     addressLine2: address.addressLine2,
     city: address.city,
     region: address.region,
@@ -495,8 +512,11 @@ function addressInput(address: MappedAddress, scope: TenantScope): Record<string
     country: address.country,
     companyName: address.companyName,
     name: address.name,
-    isPrimary: address.isPrimary,
   }
+  for (const [field, value] of Object.entries(optional)) {
+    if (value !== null) input[field] = value
+  }
+  return input
 }
 
 /**

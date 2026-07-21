@@ -748,6 +748,27 @@ describe('per-customer address reconciliation', () => {
     expect(creates.filter((call) => call.input.isPrimary === true)).toHaveLength(1)
     expect(creates.filter((call) => call.input.isPrimary === false)).toHaveLength(2)
   })
+
+  it('omits absent optional address fields rather than sending null', async () => {
+    // Core's `addressCreateSchema` types these `.optional()` but NOT `.nullable()`, so a null is an
+    // `invalid_type` reject that fails the whole customer. Shopify omits company and the second line
+    // for almost every address, so the mapper's null MUST reach core as an ABSENT key, not a null.
+    const harness = makeHarness()
+    await runAdapter(harness, [customerNode()]) // default address: street, city, zip — no company/line2/country
+    const create = harness.commandCalls.find((call) => call.commandId === COMMAND.addressCreate)!
+
+    // Present fields are sent through untouched…
+    expect(create.input.addressLine1).toBe(STREET)
+    expect(create.input.city).toBe('London')
+    expect(create.input.postalCode).toBe('SE1 9RT')
+    // …absent ones are OMITTED, and NOTHING is ever sent as null.
+    expect(create.input).not.toHaveProperty('companyName')
+    expect(create.input).not.toHaveProperty('addressLine2')
+    expect(create.input).not.toHaveProperty('country')
+    expect(create.input).not.toHaveProperty('region')
+    expect(create.input).not.toHaveProperty('name')
+    expect(Object.values(create.input)).not.toContain(null)
+  })
 })
 
 describe('per-item failures are reported, never thrown', () => {

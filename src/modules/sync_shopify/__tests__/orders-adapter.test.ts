@@ -1,5 +1,5 @@
 import type { ImportBatch, StreamImportInput } from '@open-mercato/core/modules/data_sync/lib/adapter'
-import type { BulkExport, BulkNode } from '../lib/bulk'
+import { reassembleBulkStream, type BulkAnomaly, type BulkExport, type BulkNode } from '../lib/bulk'
 import { SEARCH_DEBUG_HEADER, type ShopifyClient } from '../lib/client'
 import { COMMAND, COMMAND_RESULT_KEY, ENTITY_TYPE, INTEGRATION_ID, MAPPING_ENTITY_TYPE, OM_ENTITY_ID, PROVIDER_KEY } from '../lib/constants'
 import { parseCursor, serializeCursor } from '../lib/cursor'
@@ -457,6 +457,44 @@ describe('adapter shape', () => {
     expect(query.match(/edges/g)).toHaveLength(3)
     expect(query).not.toContain('first:')
     expect(query).toContain('totalPriceSet')
+  })
+
+  it('selects id on shipping lines — the flattened child needs a GID or it fails as missing_id', () => {
+    // shippingLines is a connection, so in the bulk export each line is its OWN JSONL record keyed to
+    // the order by the type in its GID. Drop `id` here and every order with a shipping line dies at
+    // reassembly. Both the line item and the shipping line inside the connection must select id.
+    const query = buildOrderBulkQuery()
+    expect(query).toMatch(/shippingLines\s*\{\s*edges\s*\{\s*node\s*\{\s*id\b/)
+    expect(query).toMatch(/lineItems\s*\{\s*edges\s*\{\s*node\s*\{\s*id\b/)
+  })
+
+  it('reassembles a bulk order whose shipping line carries an id (regression: missing_id)', async () => {
+    // The REAL Shopify JSONL shape for the fixed query: order, then its line item and shipping line
+    // as separate `__parentId`-linked lines, each with its own GID. Exercised through the actual
+    // reassembler — the coverage `toOrderBulkNode` could not give, since it synthesised the id.
+    const jsonl = [
+      JSON.stringify({ id: 'gid://shopify/Order/5001', name: '#5001' }),
+      JSON.stringify({ id: 'gid://shopify/LineItem/1', quantity: 1, __parentId: 'gid://shopify/Order/5001' }),
+      JSON.stringify({ id: 'gid://shopify/ShippingLine/9', title: 'Standard', __parentId: 'gid://shopify/Order/5001' }),
+    ]
+    const nodes: BulkNode[] = []
+    for await (const node of reassembleBulkStream(jsonl)) nodes.push(node)
+    expect(nodes).toHaveLength(1)
+
+    const order = bulkNodeToOrder(nodes[0])
+    expect(order.shippingLines?.nodes).toHaveLength(1)
+    expect(order.shippingLines?.nodes?.[0]?.title).toBe('Standard')
+  })
+
+  it('an id-less shipping line is exactly what trips missing_id — the invariant the query satisfies', async () => {
+    const anomalies: BulkAnomaly[] = []
+    const jsonl = [
+      JSON.stringify({ id: 'gid://shopify/Order/5001', name: '#5001' }),
+      JSON.stringify({ title: 'Standard', __parentId: 'gid://shopify/Order/5001' }), // the bug: no id
+    ]
+    const drained: BulkNode[] = []
+    for await (const node of reassembleBulkStream(jsonl, { onAnomaly: (a) => anomalies.push(a) })) drained.push(node)
+    expect(anomalies).toContainEqual(expect.objectContaining({ kind: 'missing_id' }))
   })
 })
 
