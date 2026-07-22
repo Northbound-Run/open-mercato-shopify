@@ -1,6 +1,6 @@
 {
   "name": "@northbound-run/sync-shopify",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Shopify → Open Mercato Data Sync adapter: syncs products, variants, prices, collections, customers and orders from a Shopify store into Open Mercato's native catalog, customer and sales entities.",
   "type": "module",
   "main": "./dist/index.js",
