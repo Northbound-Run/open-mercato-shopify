@@ -116,6 +116,14 @@ export type OrderSyncRuntime = {
   /** Resolve a Shopify customer GID to a local `CustomerEntity` id, under `INTEGRATION_ID.customers`. */
   resolveCustomerLocalId(customerExternalId: string): Promise<string | null>
   /**
+   * Natural-key heal for the customer link: resolve a local `CustomerEntity` id by its
+   * `primaryEmail`. Reached ONLY when the GID mapping is absent — the customers sync ran after this
+   * order, or has not run yet — mirroring how the customers adapter itself adopts a row by email.
+   * The order link lives in a column the content hash cannot see, so this is what lets a re-run
+   * attach a customer to an order that was first imported before that customer existed locally.
+   */
+  resolveCustomerLocalIdByEmail(email: string): Promise<string | null>
+  /**
    * OPTIONAL. Map Shopify's display statuses to dictionary entry ids for the native
    * `payment_status`/`fulfillment_status` columns. Absent by default: the order command populates
    * those columns only from `*EntryId`s (never raw text), so without this port the statuses are kept
@@ -415,7 +423,41 @@ function readStoredHash(row: EntityRow | null | undefined): string | null {
   return typeof hash === 'string' && hash.length > 0 ? hash : null
 }
 
+/** The stored order's current customer link, or null — the signal the self-heal re-link keys on. */
+function readCustomerEntityId(row: EntityRow | null | undefined): string | null {
+  const value = row?.customerEntityId
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
 // ── Order input assembly ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the local customer id for an order — GID mapping first, email second.
+ *
+ * Only an order Shopify itself attributed to a customer is ever linked: a guest order (no
+ * `customer`) is left unlinked even when its email matches a local customer, matching Shopify's own
+ * model. When the customer exists on Shopify but its GID mapping is not present yet — the customers
+ * sync ran after this order, or has not run — the email natural key heals the link, exactly as the
+ * customers adapter adopts a row by `primaryEmail`.
+ *
+ * Hoisted out of `buildOrderInput` on purpose: the update path compares this against the stored
+ * order so a customer-less order can be RE-LINKED later. The link sits in no column the content hash
+ * covers, so without that comparison an order imported before its customer existed would be skipped
+ * on every subsequent run and never gain the link.
+ */
+async function resolveCustomerEntityId(
+  runtime: OrderSyncRuntime,
+  mapped: MappedOrder,
+): Promise<string | null> {
+  if (!mapped.customerExternalId) return null
+  const byGid = await runtime.resolveCustomerLocalId(mapped.customerExternalId)
+  if (byGid) return byGid
+  if (mapped.customerEmail) {
+    const byEmail = await runtime.resolveCustomerLocalIdByEmail(mapped.customerEmail)
+    if (byEmail) return byEmail
+  }
+  return null
+}
 
 /**
  * Turn a mapped order into the `sales.orders.create`/`update` payload.
@@ -430,6 +472,7 @@ async function buildOrderInput(
   runtime: OrderSyncRuntime,
   scope: TenantScope,
   notes: string[],
+  customerEntityId: string | null,
 ): Promise<Record<string, unknown>> {
   const lines: Record<string, unknown>[] = []
   for (const line of mapped.lines) {
@@ -451,10 +494,6 @@ async function buildOrderInput(
     position: adj.position,
     ...(adj.metadata ? { metadata: adj.metadata } : {}),
   }))
-
-  const customerEntityId = mapped.customerExternalId
-    ? await runtime.resolveCustomerLocalId(mapped.customerExternalId)
-    : null
 
   const statusEntryIds = runtime.resolveStatusEntryIds
     ? await runtime.resolveStatusEntryIds({
@@ -627,6 +666,12 @@ async function importOrder(
 
   const notes = [...mapped.notes]
 
+  // Resolve the customer ONCE, up front, so the update path can compare it against the stored order.
+  // The link is written into `customer_entity_id`, a column no content-hash field covers, so an order
+  // first imported before its customer's mapping existed carries a null the hash cannot see. Holding
+  // the resolved id here is what lets the update branch below re-link it on a later run.
+  const customerEntityId = await resolveCustomerEntityId(runtime, mapped)
+
   const outcome = await runtime.writer.upsert({
     externalId: mapped.externalId,
     mappingEntityType: MAPPING_ENTITY_TYPE.salesOrder,
@@ -635,11 +680,19 @@ async function importOrder(
     resultKey: COMMAND_RESULT_KEY.order,
     readById: runtime.readOrder,
     findByNaturalKey: () => runtime.findOrderByExternalReference(mapped.externalId),
-    buildCreateInput: () => buildOrderInput(mapped, runtime, scope, notes),
+    buildCreateInput: () => buildOrderInput(mapped, runtime, scope, notes, customerEntityId),
     // The hash sits in the persisted order's `metadata.shopify.contentHash`; an unchanged order costs
-    // one read and no write, and its children are then left alone.
-    buildUpdateInput: async ({ row }) =>
-      readStoredHash(row) === mapped.contentHash ? null : await buildOrderInput(mapped, runtime, scope, notes),
+    // one read and no write, and its children are then left alone — UNLESS we can now attach a
+    // customer the stored row is missing. A resolvable customer the order lacks forces the one rewrite
+    // that finally lands the link (the hash can't see it); when the customer still cannot be resolved
+    // the run falls through to the skip, so there is no churn while customers are yet to sync.
+    buildUpdateInput: async ({ row }) => {
+      if (readStoredHash(row) === mapped.contentHash) {
+        const canRelinkCustomer = customerEntityId !== null && readCustomerEntityId(row) === null
+        if (!canRelinkCustomer) return null
+      }
+      return buildOrderInput(mapped, runtime, scope, notes, customerEntityId)
+    },
   })
 
   if (notes.length > 0) log?.({ kind: 'mapping_notes', externalId: mapped.externalId, notes })

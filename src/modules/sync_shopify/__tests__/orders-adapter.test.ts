@@ -92,8 +92,10 @@ type HarnessOptions = {
   variants?: Record<string, string>
   /** sku → local id, the variant fallback. */
   variantsBySku?: Record<string, string>
-  /** customer gid → local id, under the customers integration. */
+  /** customer gid → local id, under the customers integration. Mutate in place to model a later sync. */
   customers?: Record<string, string>
+  /** customer email → local id, the GID-mapping-absent natural-key fallback. */
+  customersByEmail?: Record<string, string>
   /** Local ids this integration owns, for reconciliation. */
   ownedOrders?: string[]
   /** local id → external gid, the reconciliation ownership gate. */
@@ -117,12 +119,22 @@ function makeHarness(options: HarnessOptions = {}) {
 
       if (commandId === COMMAND.orderCreate) {
         const id = `order-${(seq += 1)}`
-        rows.set(id, { id, metadata: input.metadata, externalReference: input.externalReference as string })
+        rows.set(id, {
+          id,
+          metadata: input.metadata,
+          externalReference: input.externalReference as string,
+          customerEntityId: (input.customerEntityId as string | undefined) ?? null,
+        })
         return { result: { orderId: id } }
       }
       if (commandId === COMMAND.orderUpdate) {
         const id = input.id as string
-        rows.set(id, { ...(rows.get(id) ?? { id }), metadata: input.metadata })
+        const prev = rows.get(id) ?? { id }
+        // Core applies customerEntityId only when the key is present (documents.ts: `!== undefined`),
+        // so an update that OMITS it preserves the existing link rather than clearing it.
+        const next: EntityRow = { ...prev, metadata: input.metadata }
+        if ('customerEntityId' in input) next.customerEntityId = (input.customerEntityId as string | undefined) ?? null
+        rows.set(id, next)
         return { result: { orderId: id } }
       }
       if (commandId === COMMAND.orderDelete) return { result: { orderId: input.id } }
@@ -177,6 +189,7 @@ function makeHarness(options: HarnessOptions = {}) {
       return null
     },
     resolveCustomerLocalId: async (gid) => options.customers?.[gid] ?? null,
+    resolveCustomerLocalIdByEmail: async (email) => options.customersByEmail?.[email] ?? null,
     execute: async (commandId, input) => commandBus.execute(commandId, { input, ctx: writer.commandContext }),
     listOwnedOrderIds: async () => options.ownedOrders ?? [],
     ...(options.resolveStatus
@@ -558,6 +571,77 @@ describe('order upsert routes lines and adjustments inline for atomic totals', (
     expect(created2.input.paymentStatusEntryId).toBeUndefined()
     // Statuses still preserved, in metadata.
     expect((created2.input.metadata as any).shopify.financialStatus).toBe('PAID')
+  })
+})
+
+// ── Customer linking: GID mapping, email fallback, self-heal ────────────────────────────────────
+
+describe('order → customer linking', () => {
+  it('links by the customer GID mapping when it is present', async () => {
+    const harness = makeHarness({ customers: { 'gid://shopify/Customer/9001': 'cust-by-gid' } })
+    await runBackfill(harness, [orderNode()])
+    const create = harness.commandCalls.find((c) => c.commandId === COMMAND.orderCreate)!
+    expect(create.input.customerEntityId).toBe('cust-by-gid')
+  })
+
+  it('falls back to the email natural key when the customer GID has no mapping yet', async () => {
+    // The customers sync has not mapped this GID, but the customer already exists locally by email.
+    const harness = makeHarness({ customersByEmail: { 'buyer@example.com': 'cust-by-email' } })
+    const node = orderNode({ customer: { id: 'gid://shopify/Customer/9001', email: 'buyer@example.com' } })
+    await runBackfill(harness, [node])
+    const create = harness.commandCalls.find((c) => c.commandId === COMMAND.orderCreate)!
+    expect(create.input.customerEntityId).toBe('cust-by-email')
+  })
+
+  it('does NOT link a guest order (no Shopify customer) even when its email matches a local customer', async () => {
+    // Shopify kept these separate — a guest checkout is not the customer account. We follow that.
+    const harness = makeHarness({ customersByEmail: { 'guest@example.com': 'cust-by-email' } })
+    const node = orderNode({ customer: null, email: 'guest@example.com' })
+    await runBackfill(harness, [node])
+    const create = harness.commandCalls.find((c) => c.commandId === COMMAND.orderCreate)!
+    expect(create.input.customerEntityId).toBeUndefined()
+  })
+
+  it('🔴 re-links a customer-less order once the customer mapping appears (self-heal on re-run)', async () => {
+    // The regression: orders backfilled before the customers backfill finished were written with a
+    // null customer, and — because the link is invisible to the content hash — stayed null forever.
+    const customers: Record<string, string> = {} // no customer mapping on the first run
+    const harness = makeHarness({ customers })
+
+    // Run 1: customer not synced yet → order created with no link.
+    await runBackfill(harness, [orderNode()])
+    const created = harness.commandCalls.find((c) => c.commandId === COMMAND.orderCreate)!
+    expect(created.input.customerEntityId).toBeUndefined()
+    expect(harness.rows.get('order-1')?.customerEntityId).toBeNull()
+
+    // The customers sync lands: the GID now resolves.
+    customers['gid://shopify/Customer/9001'] = 'cust-local-1'
+
+    // Run 2: byte-identical order (unchanged content hash) must NOT skip — it re-links the customer.
+    const batches = await runBackfill(harness, [orderNode()])
+    expect(items(batches)[0].action).toBe('update')
+    const update = harness.commandCalls.filter((c) => c.commandId === COMMAND.orderUpdate).pop()!
+    expect(update.input.customerEntityId).toBe('cust-local-1')
+    expect(harness.rows.get('order-1')?.customerEntityId).toBe('cust-local-1')
+  })
+
+  it('still skips an unchanged, already-linked order (no churn once the link is in place)', async () => {
+    const harness = makeHarness({ customers: { 'gid://shopify/Customer/9001': 'cust-local-1' } })
+    await runBackfill(harness, [orderNode()])
+    const before = harness.commandCalls.length
+    const batches = await runBackfill(harness, [orderNode()])
+    expect(items(batches)[0].action).toBe('skip')
+    expect(harness.commandCalls.length).toBe(before)
+  })
+
+  it('does not rewrite forever when the customer is still unresolvable (unchanged hash → skip)', async () => {
+    const harness = makeHarness() // customer never resolves (no gid mapping, no email)
+    await runBackfill(harness, [orderNode()])
+    const before = harness.commandCalls.length
+    const batches = await runBackfill(harness, [orderNode()])
+    // Nothing to relink → falls through to the normal content-hash skip, no update issued.
+    expect(items(batches)[0].action).toBe('skip')
+    expect(harness.commandCalls.length).toBe(before)
   })
 })
 

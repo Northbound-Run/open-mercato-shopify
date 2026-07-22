@@ -382,6 +382,11 @@ export async function createOrdersRuntime(
   })
 
   const variantBySku = writer.naturalKeyLookup(E.variant, 'sku')
+  // Customer email natural-key lookup, for the order→customer link when the GID mapping is absent.
+  // Scoped org+tenant by the writer (no integration id — the customer is resolved by its own natural
+  // key, not by a mapping). Goes through `findOne` = `findOneWithDecryption`, so an encrypted
+  // `primaryEmail` still matches.
+  const customerByEmail = writer.naturalKeyLookup(E.customerEntity, 'primaryEmail')
   const mapping: OrdersMappingPort = run.mappingService
 
   // `SalesOrder` is resolved from the container by name rather than imported: sales/di.ts registers it
@@ -428,6 +433,12 @@ export async function createOrdersRuntime(
         customerExternalId,
         scope,
       ),
+    // Email heal for the link. Lowercased to match the customers adapter, which stores `primaryEmail`
+    // lowercased (and core normalises it on write), so an order's mixed-case Shopify email still hits.
+    resolveCustomerLocalIdByEmail: async (email) => {
+      const row = await customerByEmail(email.trim().toLowerCase())
+      return row?.id ?? null
+    },
     // ⚠️ NON-VOID, unlike products' `execute`. Orders dispatches child creates (payments, shipments)
     // and needs their ids back (`paymentId`/`shipmentId`), so the bus envelope's `result` is returned
     // rather than swallowed.

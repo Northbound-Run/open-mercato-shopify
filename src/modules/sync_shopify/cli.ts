@@ -1,9 +1,14 @@
 import type { IntegrationScope } from '@open-mercato/shared/modules/integrations/types'
 import {
   BUNDLE_ID,
+  COMMAND,
   DEFAULT_API_VERSION,
+  INTEGRATION_ID,
   INVENTORY_DAILY_RETENTION_DAYS,
+  MAPPING_ENTITY_TYPE,
 } from './lib/constants'
+import { createShopifyClientFromCredentials } from './lib/runtime'
+import { buildCommandContext } from './lib/writer'
 import { formatProbeResult, probeConnection } from './lib/probe'
 import {
   applyShopifyEnvPreset,
@@ -297,6 +302,188 @@ const pruneInventory: ModuleCli = {
   },
 }
 
+/**
+ * Re-fetch each order's customer from Shopify by the order GID.
+ *
+ * The customer GID is not stored on the local order, so a null link cannot be repaired from the
+ * database alone — the order has to be looked up again. `nodes(ids:)` fetches a specific set by id,
+ * which is exactly the owned orders we already know are missing a customer.
+ */
+const RELINK_QUERY = `#graphql
+  query SyncShopifyRelinkOrders($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Order { id customer { id } }
+    }
+  }
+`
+
+type RelinkResponse = {
+  nodes?: ({ id?: string | null; customer?: { id?: string | null } | null } | null)[] | null
+}
+
+/**
+ * Backfill the customer link on orders imported before their customer existed locally.
+ *
+ * The orders adapter now self-heals on any re-import (GID mapping, then email), but a delta only
+ * re-fetches orders that CHANGED upstream — an old, unchanged order never comes back through it. So
+ * existing null links need either a full re-backfill or this targeted repair, which touches only the
+ * orders that are actually missing a customer and never resets a cursor or re-runs reconciliation.
+ *
+ * Dry-run by default (mirroring `prune-inventory`): it reports what it would link; `--confirm` writes.
+ */
+const relinkOrders: ModuleCli = {
+  command: 'relink-orders',
+  async run(argv) {
+    const flags = parseArgs(argv)
+    const tenantId = str(flags.tenant) || str(flags['tenant-id'])
+    const organizationId = str(flags.org) || str(flags['organization-id'])
+    if (!tenantId || !organizationId) {
+      console.error('\n  ✗ --tenant and --org are required.\n')
+      process.exitCode = 1
+      return
+    }
+
+    let credentials: ResolvedCredentials
+    try {
+      credentials = await resolveCredentials(flags, process.env)
+    } catch (error) {
+      console.error(`\n  ✗ ${error instanceof Error ? error.message : String(error)}\n`)
+      process.exitCode = 1
+      return
+    }
+
+    const confirmed = flags.confirm === true || str(flags.confirm) === 'true'
+    const batchSize = Math.min(Math.max(Number(str(flags.batch) || 100) || 100, 1), 250)
+
+    const { createRequestContainer } = await import('@open-mercato/shared/lib/di/container')
+    const container = await createRequestContainer()
+    try {
+      const scope = { organizationId, tenantId }
+      const em = container.resolve('em') as {
+        find(entity: unknown, where: Record<string, unknown>): Promise<Record<string, unknown>[]>
+      }
+      const commandBus = container.resolve('commandBus') as {
+        execute(commandId: string, opts: { input: Record<string, unknown>; ctx: unknown }): Promise<{ result: unknown }>
+      }
+      const mappingService = container.resolve('externalIdMappingService') as {
+        lookupLocalId(i: string, e: string, x: string, s: typeof scope): Promise<string | null>
+      }
+      const client = createShopifyClientFromCredentials(credentials as unknown as Record<string, unknown>)
+      const ctx = buildCommandContext(container as never, scope)
+
+      const { SyncExternalIdMapping } = await import(
+        '@open-mercato/core/modules/integrations/data/entities'
+      )
+      const SalesOrder = container.resolve('SalesOrder')
+
+      // 1. Every order this integration owns — local id ↔ Shopify GID.
+      const mappings = (await em.find(SyncExternalIdMapping, {
+        integrationId: INTEGRATION_ID.orders,
+        internalEntityType: MAPPING_ENTITY_TYPE.salesOrder,
+        organizationId,
+        tenantId,
+      })) as { internalEntityId: string; externalId: string }[]
+
+      if (mappings.length === 0) {
+        console.log('\n  No Shopify-owned orders found for this tenant.\n')
+        return
+      }
+
+      // 2. Of those, the ones whose customer link is still null.
+      const gidByLocalId = new Map(mappings.map((m) => [m.internalEntityId, m.externalId]))
+      const localIdByGid = new Map(mappings.map((m) => [m.externalId, m.internalEntityId]))
+      const nullCustomer = (await em.find(SalesOrder as unknown as object, {
+        id: { $in: [...gidByLocalId.keys()] },
+        customerEntityId: null,
+        organizationId,
+        tenantId,
+        deletedAt: null,
+      })) as { id: string }[]
+
+      console.log(`\n  Shopify order → customer relink (tenant ${tenantId})\n`)
+      console.log(`    owned orders        ${mappings.length}`)
+      console.log(`    missing customer    ${nullCustomer.length}`)
+      if (nullCustomer.length === 0) {
+        console.log('\n  Nothing to relink.\n')
+        return
+      }
+
+      // 3. Re-fetch each order's customer from Shopify and resolve it against the customers sync's
+      //    external-id mappings. A guest order has no customer; a customer not yet synced has no
+      //    mapping — both are reported and skipped rather than guessed at.
+      const orderGids = nullCustomer
+        .map((o) => gidByLocalId.get(o.id))
+        .filter((g): g is string => typeof g === 'string')
+
+      let noShopifyCustomer = 0
+      let customerNotSynced = 0
+      const plan: { localId: string; customerEntityId: string }[] = []
+
+      for (let i = 0; i < orderGids.length; i += batchSize) {
+        const ids = orderGids.slice(i, i + batchSize)
+        const data = await client.request<RelinkResponse>(RELINK_QUERY, {
+          variables: { ids },
+          estimatedCost: ids.length * 2,
+        })
+        for (const node of data?.nodes ?? []) {
+          const orderGid = node?.id
+          if (typeof orderGid !== 'string') continue
+          const localId = localIdByGid.get(orderGid)
+          if (!localId) continue
+          const customerGid = node?.customer?.id
+          if (typeof customerGid !== 'string' || customerGid === '') {
+            noShopifyCustomer += 1
+            continue
+          }
+          const customerEntityId = await mappingService.lookupLocalId(
+            INTEGRATION_ID.customers,
+            MAPPING_ENTITY_TYPE.customerEntity,
+            customerGid,
+            scope,
+          )
+          if (!customerEntityId) {
+            customerNotSynced += 1
+            continue
+          }
+          plan.push({ localId, customerEntityId })
+        }
+      }
+
+      console.log(`    now linkable        ${plan.length}`)
+      console.log(`    no Shopify customer ${noShopifyCustomer}`)
+      console.log(`    customer not synced ${customerNotSynced}`)
+
+      if (plan.length === 0) {
+        console.log('\n  Nothing to update. Run the Customers sync first so customer mappings exist.\n')
+        return
+      }
+      if (!confirmed) {
+        console.log('\n  Dry run. Re-run with --confirm to write the customer links.\n')
+        return
+      }
+
+      let updated = 0
+      for (const { localId, customerEntityId } of plan) {
+        try {
+          await commandBus.execute(COMMAND.orderUpdate, {
+            input: { id: localId, organizationId, tenantId, customerEntityId },
+            ctx,
+          })
+          updated += 1
+        } catch (error) {
+          console.log(`    ! order ${localId}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      console.log(`\n  ✓ Linked ${updated} order(s) to their customers.\n`)
+    } catch (error) {
+      console.error(`\n  ✗ ${error instanceof Error ? error.message : String(error)}\n`)
+      process.exitCode = 1
+    } finally {
+      await (container as unknown as { dispose?: () => Promise<void> }).dispose?.()
+    }
+  },
+}
+
 const help: ModuleCli = {
   command: 'help',
   run() {
@@ -343,11 +530,20 @@ sync_shopify — Shopify sync for Open Mercato
       --older-than-days <n>    retention window, default ${INVENTORY_DAILY_RETENTION_DAYS}
       --confirm                actually delete; without it this is a dry run
 
+  yarn mercato sync_shopify relink-orders --tenant <id> --org <id> [flags]
+      Backfill the customer link on orders that were imported before their customer existed
+      locally (e.g. the orders backfill finished before the customers backfill). Re-fetches each
+      customer-less order's customer from Shopify and links it to the already-synced customer.
+      Touches only orders missing a customer; never resets a cursor. Run the Customers sync first.
+
+      --confirm                actually write the links; without it this is a dry run
+      --batch <n>              orders re-fetched per Shopify call, default 100 (max 250)
+
   yarn mercato sync_shopify help
 `)
   },
 }
 
-export const cli: ModuleCli[] = [testConnection, configureFromEnv, pruneInventory, help]
+export const cli: ModuleCli[] = [testConnection, configureFromEnv, pruneInventory, relinkOrders, help]
 
 export default cli
