@@ -40,6 +40,11 @@ yarn db:migrate
 `module add` registers the module in `src/modules.ts` and runs `mercato generate`. `db:migrate`
 applies the single migration this package ships (the inventory snapshot table).
 
+The package declares `@open-mercato/core` / `@open-mercato/shared` as **peer dependencies** —
+your app provides them. This matters: the Data Sync adapter registry is process-global, so a
+second, nested copy of core installed under this package would leave the adapters invisible
+to queue workers.
+
 The `--allow-third-party` flag is required because the package is not under the `@open-mercato`
 scope — it is a supply-chain opt-in, nothing more.
 

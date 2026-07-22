@@ -83,11 +83,7 @@ function buildRuntimeEnv(): RuntimeEnv {
   }
 }
 
-export function register(container: AppContainer) {
-  container.register({
-    [HEALTH_CHECK_SERVICE]: asValue(shopifyHealthCheck),
-  })
-
+function registerAdapters(): void {
   const env = buildRuntimeEnv()
 
   // Each adapter's `providerKey` must equal the `providerKey` its IntegrationDefinition declares in
@@ -129,6 +125,21 @@ export function register(container: AppContainer) {
       writeCustomFields: inventory.writeCustomFields,
     }),
   )
+}
+
+// Import-time, not just di.register()-time: data-sync runs execute in separate queue-worker
+// processes (`mercato queue worker`) whose container bootstrap may not replay every module's
+// di.register() — but the app's generated DI registry always *imports* this module, so an
+// import-time side effect is the only registration path guaranteed to run in every process.
+// The registry is a keyed map, so the repeat call inside register() is a harmless no-op.
+registerAdapters()
+
+export function register(container: AppContainer) {
+  container.register({
+    [HEALTH_CHECK_SERVICE]: asValue(shopifyHealthCheck),
+  })
+
+  registerAdapters()
 }
 
 export default register
