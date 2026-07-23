@@ -138,7 +138,13 @@ export type ProductsRuntime = {
   readVariant(localId: string): Promise<EntityRow | null>
   readPrice(localId: string): Promise<EntityRow | null>
   findProductByHandle(handle: string): Promise<EntityRow | null>
-  findVariantBySku(sku: string): Promise<EntityRow | null>
+  /**
+   * A live variant matched by SKU **within one product**. SKU is not unique across products in
+   * Shopify, so the natural-key fallback must be product-scoped: a tenant-wide by-SKU lookup can
+   * resolve to a sibling product's variant and silently re-parent it onto the product being
+   * processed (the content hash omits productId, so the damage is invisible to later runs).
+   */
+  findVariantBySkuAndProduct(sku: string, productLocalId: string): Promise<EntityRow | null>
   /**
    * `CatalogPriceKind` by code.
    *
@@ -514,7 +520,10 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
       updateCommand: COMMAND.variantUpdate,
       resultKey: COMMAND_RESULT_KEY.variant,
       readById: ctx.runtime.readVariant,
-      findByNaturalKey: mapped.sku === null ? undefined : () => ctx.runtime.findVariantBySku(mapped.sku!),
+      findByNaturalKey:
+        mapped.sku === null
+          ? undefined
+          : () => ctx.runtime.findVariantBySkuAndProduct(mapped.sku!, productLocalId),
       buildCreateInput: () => mapped.input,
       buildUpdateInput: ({ row }) =>
         readContentHash(row) === mapped.contentHash ? null : mapped.input,

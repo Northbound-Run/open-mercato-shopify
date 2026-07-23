@@ -41,24 +41,42 @@ function makeWriter(store: Store, writes: WriteRecord[]) {
 
     async upsert(spec: UpsertSpec): Promise<WriteOutcome> {
       try {
-        const mapped = mappings.get(storeKey(spec.mappingEntityType, spec.externalId))
-        const existing = mapped ? rows.get(mapped) : undefined
+        // Faithful two-stage resolution, mirroring the real writer's `resolveExisting`: mapping first
+        // (re-read to prove the row still exists), natural key second. The natural-key stage is not
+        // decorative — without it this stub cannot exercise (or regress) how the adapter resolves a
+        // not-yet-mapped variant, which is exactly where product-scoped SKU matching has to hold.
+        const key = storeKey(spec.mappingEntityType, spec.externalId)
+        let resolved: { localId: string; row: EntityRow; via: 'mapping' | 'natural_key' } | null = null
 
-        if (mapped && existing) {
-          const update = await spec.buildUpdateInput({ localId: mapped, row: existing })
+        const mappedId = mappings.get(key)
+        if (mappedId) {
+          const row = rows.get(mappedId)
+          if (row) resolved = { localId: mappedId, row, via: 'mapping' }
+        }
+        if (!resolved) {
+          const row = await spec.findByNaturalKey?.()
+          if (row) resolved = { localId: row.id, row, via: 'natural_key' }
+        }
+
+        if (resolved) {
+          const update = await spec.buildUpdateInput({ localId: resolved.localId, row: resolved.row })
+          // Heal a natural-key match so the next run resolves it by mapping — the real writer stores
+          // the mapping on BOTH the skip and update branches, and that healing is the step that would
+          // make a cross-product SKU match permanent, so the stub must reproduce it.
+          if (resolved.via === 'natural_key') mappings.set(key, resolved.localId)
           if (update === null) {
-            return { ok: true, action: 'skip', externalId: spec.externalId, localId: mapped, resolvedVia: 'mapping' }
+            return { ok: true, action: 'skip', externalId: spec.externalId, localId: resolved.localId, resolvedVia: resolved.via }
           }
-          writes.push({ mappingEntityType: spec.mappingEntityType, command: 'update', input: { ...update, id: mapped } })
-          rows.set(mapped, { ...existing, ...update, id: mapped })
-          return { ok: true, action: 'update', externalId: spec.externalId, localId: mapped, resolvedVia: 'mapping' }
+          writes.push({ mappingEntityType: spec.mappingEntityType, command: 'update', input: { ...update, id: resolved.localId } })
+          rows.set(resolved.localId, { ...resolved.row, ...update, id: resolved.localId })
+          return { ok: true, action: 'update', externalId: spec.externalId, localId: resolved.localId, resolvedVia: resolved.via }
         }
 
         const input = await spec.buildCreateInput()
         writes.push({ mappingEntityType: spec.mappingEntityType, command: 'create', input })
         const localId = `local-${++sequence}`
         rows.set(localId, { ...input, id: localId })
-        mappings.set(storeKey(spec.mappingEntityType, spec.externalId), localId)
+        mappings.set(key, localId)
         return { ok: true, action: 'create', externalId: spec.externalId, localId, resolvedVia: 'created' }
       } catch (error) {
         return {
@@ -206,7 +224,11 @@ function makeHarness(script: ClientScript = {}, previous?: { store: Store }, ext
     readVariant: async (id) => store.rows.get(id) ?? null,
     readPrice: async (id) => store.rows.get(id) ?? null,
     findProductByHandle: async () => null,
-    findVariantBySku: async () => null,
+    // Product-scoped by construction, mirroring `findVariantsByProductId` below: a SKU is matched
+    // only among the rows already parented to THIS product, so the fallback can never resolve to a
+    // sibling product's variant.
+    findVariantBySkuAndProduct: async (sku, productLocalId) =>
+      [...store.rows.values()].find((row) => row.sku === sku && row.productId === productLocalId) ?? null,
     findPriceKindByCode: async (code) => priceKinds.get(code) ?? null,
     findVariantsByProductId: async (productLocalId) => {
       calls.findVariantsByProductId.push(productLocalId)
@@ -343,6 +365,42 @@ describe('shopify products adapter — contract', () => {
     expect(external).toContain('descriptionHtml')
     expect(external).not.toContain('bodyHtml')
     expect(external).not.toContain('images')
+  })
+})
+
+// ── 🔴 Variant SKU fallback is product-scoped — never re-parent a sibling's variant ──────────
+
+describe('a variant is resolved by SKU only within its own product', () => {
+  // Shopify allows the SAME sku on variants of DIFFERENT products (sku is unique only within a
+  // product). When a variant is first seen its gid is unmapped, so the writer falls back to the
+  // natural key. A tenant-wide by-SKU lookup would then match the OTHER product's variant and the
+  // update would stamp this product's id onto it — and because the content hash omits productId,
+  // that mis-parenting is invisible to every later run and never heals. The fallback must pin the
+  // product. Regression for the field report against jennykrauss.myshopify.com, where Berries-on-Vine
+  // variants surfaced under In-the-Garden.
+  it('creates a same-SKU variant under its own product instead of re-parenting the other', async () => {
+    const shared = 'SHARED-SKU'
+    const v1 = { ...VARIANT_A, id: 'gid://shopify/ProductVariant/101', sku: shared }
+    const v2 = { ...VARIANT_A, id: 'gid://shopify/ProductVariant/202', sku: shared }
+
+    // One delta run carrying both products; product 1 (and its variant) is committed before product 2
+    // is processed, so v2's fallback runs against a store that already holds v1 under product 1.
+    const h = makeHarness({ deltaPages: [{ nodes: [delta(PRODUCT_1, [v1]), delta(PRODUCT_2, [v2])] }] })
+    const batches = await collect(h, { cursor: IDLE_CURSOR })
+
+    // Each variant is CREATED under its own product — not resolved onto, and re-parented into, the other.
+    expect(actionsFor(batches, v1.id)).toEqual(['create'])
+    expect(actionsFor(batches, v2.id)).toEqual(['create'])
+
+    const p1 = localIdOf(h, 'catalog_product', PRODUCT_1.id)
+    const p2 = localIdOf(h, 'catalog_product', PRODUCT_2.id)
+    expect(p1).not.toBe(p2)
+
+    const row1 = rowOf(h, 'catalog_product_variant', v1.id)
+    const row2 = rowOf(h, 'catalog_product_variant', v2.id)
+    expect(row1.id).not.toBe(row2.id)
+    expect(row1.productId).toBe(p1)
+    expect(row2.productId).toBe(p2)
   })
 })
 

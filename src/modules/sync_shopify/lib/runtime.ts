@@ -225,7 +225,14 @@ export async function createProductsRuntime(
     // `CatalogProductPrice` has no deleted_at column — scope org + tenant only.
     readPrice: (localId) => env.findOne(run.em, E.price, scoped(scope, { id: localId }), undefined, scope),
     findProductByHandle: writer.naturalKeyLookup(E.product, 'handle'),
-    findVariantBySku: writer.naturalKeyLookup(E.variant, 'sku'),
+    // SKU is unique only WITHIN a product, never across the shop, so the variant natural-key fallback
+    // MUST pin the product. A tenant-wide `naturalKeyLookup(E.variant, 'sku')` here lets the fallback
+    // resolve to a SIBLING product's variant; the ensuing update then stamps THIS product's id onto
+    // that row, and because `mapVariant` omits productId from the content hash the mis-parenting is
+    // invisible to change detection on every later run and persists. Mirrors `findVariantsByProductId`
+    // (below), narrowed to a single row.
+    findVariantBySkuAndProduct: (sku, productLocalId) =>
+      env.findOne(run.em, E.variant, scopedLive(scope, { sku, product: productLocalId }), undefined, scope),
     // 🔴 TRAP 1: TENANT ONLY. `CatalogPriceKind.organization_id` is nullable and core seeds it null,
     // so adding the organization to this where clause finds nothing and silently writes zero prices.
     findPriceKindByCode: (code) =>

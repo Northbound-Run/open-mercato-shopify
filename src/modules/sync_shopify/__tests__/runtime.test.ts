@@ -218,6 +218,26 @@ describe('products runtime', () => {
     expect(Object.keys(call.scope).sort()).toEqual(['organizationId', 'tenantId'])
   })
 
+  it('scopes the variant natural-key fallback by sku AND product, never sku alone', async () => {
+    const h = makeEnv()
+    const runtime = await build(h)
+    await runtime.findVariantBySkuAndProduct('SKU-1', 'prod-1')
+
+    const call = last(h.findOneCalls)
+    expect(call.entity).toBe('CatalogProductVariant')
+    // The fix: sku is unique only WITHIN a product, so the where clause pins the product too. A
+    // tenant-wide `{ sku }` lookup would let the fallback resolve to a sibling product's variant and
+    // re-parent it (invisibly, since the content hash omits productId).
+    expect(call.where).toEqual({
+      sku: 'SKU-1',
+      product: 'prod-1',
+      organizationId: 'org-1',
+      tenantId: 'tenant-1',
+      deletedAt: null,
+    })
+    expect(Object.keys(call.scope).sort()).toEqual(['organizationId', 'tenantId'])
+  })
+
   it('scopes findPriceKindByCode by TENANT ONLY, never by organization (trap 1)', async () => {
     const h = makeEnv()
     const runtime = await build(h)
