@@ -239,6 +239,20 @@ export async function createProductsRuntime(
       env.findOne(run.em, E.priceKind, { code, tenantId: scope.tenantId, deletedAt: null }, undefined, scope),
     findVariantsByProductId: (productLocalId) =>
       env.findMany(run.em, E.variant, scopedLive(scope, { product: productLocalId }), undefined, scope),
+    // Collision DETECTOR, never a resolver. core enforces UNIQUE(org, tenant, sku) on variants
+    // (product is NOT in the key), so a SKU Shopify repeats across products can live under only one of
+    // them per tenant. This tenant-wide probe reports the OTHER product currently holding `sku`, or
+    // null when the SKU is free or already belongs to `productLocalId`, so the importer can drop a
+    // colliding SKU instead of failing the item. It must stay tenant-wide (that is the whole point —
+    // it has to SEE a sibling product's variant); it is emphatically NOT the resolver that
+    // `findVariantBySkuAndProduct` replaced in 0.4.4 — resolving a variant by SKU tenant-wide is what
+    // re-parents it.
+    findVariantSkuConflict: async (sku, productLocalId) => {
+      const row = await env.findOne(run.em, E.variant, scopedLive(scope, { sku }), undefined, scope)
+      if (!row) return null
+      const owner = refId(row.product)
+      return owner !== null && owner !== productLocalId ? owner : null
+    },
     listOwnedLocalIds: async (entityType) => {
       const rows = await env.findMany(
         run.em,

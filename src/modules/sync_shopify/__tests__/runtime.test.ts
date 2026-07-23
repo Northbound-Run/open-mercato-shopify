@@ -238,6 +238,38 @@ describe('products runtime', () => {
     expect(Object.keys(call.scope).sort()).toEqual(['organizationId', 'tenantId'])
   })
 
+  it('detects a cross-product SKU conflict tenant-wide (sku only, never scoped by product)', async () => {
+    const h = makeEnv({ findOneResult: () => ({ id: 'variant-x', product: 'other-product' }) as EntityRow })
+    const runtime = await build(h)
+    const owner = await runtime.findVariantSkuConflict('SKU-1', 'prod-1')
+
+    // Reports the OTHER product that already holds the SKU, so the importer can drop it.
+    expect(owner).toBe('other-product')
+    const call = last(h.findOneCalls)
+    expect(call.entity).toBe('CatalogProductVariant')
+    // Tenant-wide by design — product is NOT in the where clause; the probe must SEE a sibling
+    // product's variant. This is the collision detector, the opposite of the 0.4.4 resolver.
+    expect(call.where).toEqual({
+      sku: 'SKU-1',
+      organizationId: 'org-1',
+      tenantId: 'tenant-1',
+      deletedAt: null,
+    })
+    expect(Object.keys(call.scope).sort()).toEqual(['organizationId', 'tenantId'])
+  })
+
+  it('reports no SKU conflict when the match already belongs to the same product', async () => {
+    const h = makeEnv({ findOneResult: () => ({ id: 'variant-x', product: 'prod-1' }) as EntityRow })
+    const runtime = await build(h)
+    expect(await runtime.findVariantSkuConflict('SKU-1', 'prod-1')).toBeNull()
+  })
+
+  it('reports no SKU conflict when the SKU is free', async () => {
+    const h = makeEnv()
+    const runtime = await build(h)
+    expect(await runtime.findVariantSkuConflict('SKU-1', 'prod-1')).toBeNull()
+  })
+
   it('scopes findPriceKindByCode by TENANT ONLY, never by organization (trap 1)', async () => {
     const h = makeEnv()
     const runtime = await build(h)

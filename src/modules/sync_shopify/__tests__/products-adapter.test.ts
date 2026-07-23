@@ -5,6 +5,7 @@ import type { HeartbeatClock } from '../lib/heartbeat'
 import { parseCursor } from '../lib/cursor'
 import { createShopifyProductsAdapter, type ProductsRuntime } from '../lib/adapters/products'
 import type { EntityRow, EntityWriter, UpsertSpec, WriteOutcome } from '../lib/writer'
+import { METADATA_NAMESPACE } from '../lib/mappers/product'
 
 // The framework never loads at test runtime. The writer stub below is a faithful miniature of
 // `createEntityWriter` — mapping-first resolution, a `null` update meaning skip, error containment
@@ -234,6 +235,12 @@ function makeHarness(script: ClientScript = {}, previous?: { store: Store }, ext
       calls.findVariantsByProductId.push(productLocalId)
       return [...store.rows.values()].filter((row) => row.productId === productLocalId)
     },
+    // Tenant-wide by construction (mirrors the real runtime): the OTHER product holding this SKU, or
+    // null when it is free or already this product's. Models core's UNIQUE(org, tenant, sku).
+    findVariantSkuConflict: async (sku, productLocalId) => {
+      const owner = [...store.rows.values()].find((row) => row.sku === sku)?.productId
+      return typeof owner === 'string' && owner !== productLocalId ? owner : null
+    },
     listOwnedLocalIds: async (entityType) => {
       calls.listOwnedLocalIds += 1
       const prefix = `${entityType}::`
@@ -368,39 +375,74 @@ describe('shopify products adapter — contract', () => {
   })
 })
 
-// ── 🔴 Variant SKU fallback is product-scoped — never re-parent a sibling's variant ──────────
+// ── 🔴 Cross-product SKU collision — keep both variants, drop the losing SKU ──────────────────
 
-describe('a variant is resolved by SKU only within its own product', () => {
-  // Shopify allows the SAME sku on variants of DIFFERENT products (sku is unique only within a
-  // product). When a variant is first seen its gid is unmapped, so the writer falls back to the
-  // natural key. A tenant-wide by-SKU lookup would then match the OTHER product's variant and the
-  // update would stamp this product's id onto it — and because the content hash omits productId,
-  // that mis-parenting is invisible to every later run and never heals. The fallback must pin the
-  // product. Regression for the field report against jennykrauss.myshopify.com, where Berries-on-Vine
-  // variants surfaced under In-the-Garden.
-  it('creates a same-SKU variant under its own product instead of re-parenting the other', async () => {
-    const shared = 'SHARED-SKU'
-    const v1 = { ...VARIANT_A, id: 'gid://shopify/ProductVariant/101', sku: shared }
-    const v2 = { ...VARIANT_A, id: 'gid://shopify/ProductVariant/202', sku: shared }
+describe('a SKU that collides across products is dropped, not lost', () => {
+  // Shopify allows the SAME sku on variants of DIFFERENT products; core enforces UNIQUE(org, tenant,
+  // sku) on variants, so only one product can hold a given SKU per tenant. Sending the second would
+  // fail the whole item on core's constraint and the variant would silently vanish. The importer
+  // detects the clash and creates the variant with its SKU dropped instead — both survive, the drop
+  // is recorded on the row (rejectedSku + skuConflictProductId) and surfaced on the item, and it
+  // self-heals once the SKU frees up. Regression for the field report against
+  // jennykrauss.myshopify.com, where Berries-on-Vine and In-the-Garden both carry 1010/1011BEL.
+  //
+  // (0.4.4's product-scoped natural key — findVariantBySkuAndProduct — is exercised at the runtime
+  // level in runtime.test.ts; the collision guard here now short-circuits it in this scenario by
+  // dropping the SKU before resolution.)
+  const shared = 'SHARED-SKU'
+  const v1 = { ...VARIANT_A, id: 'gid://shopify/ProductVariant/101', sku: shared }
+  const v2 = { ...VARIANT_A, id: 'gid://shopify/ProductVariant/202', sku: shared }
 
-    // One delta run carrying both products; product 1 (and its variant) is committed before product 2
-    // is processed, so v2's fallback runs against a store that already holds v1 under product 1.
+  it('creates both variants under their own products, dropping and recording the second SKU', async () => {
+    // One delta run carrying both products; product 1 (and its variant) commits before product 2 is
+    // processed, so v2 sees v1 already holding the SKU under product 1.
     const h = makeHarness({ deltaPages: [{ nodes: [delta(PRODUCT_1, [v1]), delta(PRODUCT_2, [v2])] }] })
     const batches = await collect(h, { cursor: IDLE_CURSOR })
 
-    // Each variant is CREATED under its own product — not resolved onto, and re-parented into, the other.
     expect(actionsFor(batches, v1.id)).toEqual(['create'])
     expect(actionsFor(batches, v2.id)).toEqual(['create'])
 
     const p1 = localIdOf(h, 'catalog_product', PRODUCT_1.id)
     const p2 = localIdOf(h, 'catalog_product', PRODUCT_2.id)
-    expect(p1).not.toBe(p2)
-
     const row1 = rowOf(h, 'catalog_product_variant', v1.id)
     const row2 = rowOf(h, 'catalog_product_variant', v2.id)
+
+    // Distinct rows under their own products — no re-parenting, no vanishing.
     expect(row1.id).not.toBe(row2.id)
     expect(row1.productId).toBe(p1)
     expect(row2.productId).toBe(p2)
+
+    // First keeps the SKU; the colliding second is stored without one (nulls don't collide).
+    expect(row1.sku).toBe(shared)
+    expect(row2.sku ?? null).toBeNull()
+
+    // The drop is recorded on the row…
+    const ns = (row2.metadata as any)[METADATA_NAMESPACE]
+    expect(ns.rejectedSku).toBe(shared)
+    expect(ns.skuConflictProductId).toBe(p1)
+
+    // …and surfaced on the import item so the collision is visible rather than silent.
+    const item2 = items(batches).find((i) => i.externalId === v2.id)!
+    expect(item2.data.skuConflict).toEqual({ droppedSku: shared, conflictingProductLocalId: p1 })
+
+    // The variant that kept its SKU carries no collision marker.
+    const item1 = items(batches).find((i) => i.externalId === v1.id)!
+    expect(item1.data.skuConflict).toBeUndefined()
+  })
+
+  it('restores the SKU on a later run once the other product releases it (self-healing)', async () => {
+    const first = makeHarness({ deltaPages: [{ nodes: [delta(PRODUCT_1, [v1]), delta(PRODUCT_2, [v2])] }] })
+    await collect(first, { cursor: IDLE_CURSOR })
+    expect(rowOf(first, 'catalog_product_variant', v2.id).sku ?? null).toBeNull()
+
+    // Product 1's variant is deleted upstream, freeing the SKU. Re-sync product 2 alone.
+    first.store.rows.delete(localIdOf(first, 'catalog_product_variant', v1.id))
+    const second = makeHarness({ deltaPages: [{ nodes: [delta(PRODUCT_2, [v2])] }] }, first)
+    const batches = await collect(second, { cursor: IDLE_CURSOR })
+
+    // v2 (still mapped by gid) is updated to take the now-free SKU.
+    expect(actionsFor(batches, v2.id)).toEqual(['update'])
+    expect(rowOf(second, 'catalog_product_variant', v2.id).sku).toBe(shared)
   })
 })
 

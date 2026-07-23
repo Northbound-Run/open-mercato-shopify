@@ -370,11 +370,20 @@ export function mapVariant(
   variant: ShopifyVariantNode,
   productLocalId: string,
   scope: MappingScope,
+  opts: { skuConflictProductId?: string | null } = {},
 ): MappedVariant {
   const rawSku = clip(variant.sku, MAX_SKU)
   // Core's sku pattern excludes the spaces and slashes Shopify permits. Dropping the value keeps
   // the variant; sending it would fail the whole item on a field that is only a fallback key.
-  const sku = rawSku !== null && SKU_PATTERN.test(rawSku) ? rawSku : null
+  const validSku = rawSku !== null && SKU_PATTERN.test(rawSku) ? rawSku : null
+  // A SKU another product already owns is dropped too. Core enforces UNIQUE(org, tenant, sku) on
+  // variants (product is NOT in the key) even though Shopify lets the same SKU repeat across
+  // products, so sending it would fail the whole item on that constraint. Dropping it keeps the
+  // variant under its own product — sku is nullable and Postgres treats NULLs as distinct, so a
+  // null-sku variant never collides. The importer detects the clash and passes the conflicting
+  // product in; see `findVariantSkuConflict`.
+  const skuConflictProductId = opts.skuConflictProductId ?? null
+  const sku = skuConflictProductId !== null ? null : validSku
   const optionValues = mapOptionValues(variant.selectedOptions)
 
   const namespace: Record<string, unknown> = {
@@ -384,6 +393,7 @@ export function mapVariant(
     compareAtPrice: normalizeMoney(variant.compareAtPrice),
   }
   if (rawSku !== null && sku === null) namespace.rejectedSku = rawSku
+  if (skuConflictProductId !== null) namespace.skuConflictProductId = skuConflictProductId
 
   const core: Record<string, unknown> = {
     organizationId: scope.organizationId,
@@ -398,11 +408,13 @@ export function mapVariant(
   if (barcode !== null) core.barcode = barcode
   if (Object.keys(optionValues).length > 0) core.optionValues = optionValues
 
-  // `productId` is excluded from the hash: it is a local id that differs between installs, and
-  // including it would make the hash unstable across a re-mapped product without any upstream
-  // change having occurred.
-  const { productId: _productId, ...hashable } = core
-  const contentHash = computeContentHash({ core: hashable, namespace })
+  // `productId` and `skuConflictProductId` are install-local ids excluded from the hash: like
+  // productId, the conflicting product's id differs between installs and would make the hash unstable
+  // without any upstream change. `rejectedSku` — the dropped value itself — stays hashed, so whether
+  // (and what) the sku dropped is still a detected change.
+  const { productId: _productId, ...hashableCore } = core
+  const { skuConflictProductId: _conflictProductId, ...hashableNamespace } = namespace
+  const contentHash = computeContentHash({ core: hashableCore, namespace: hashableNamespace })
 
   return {
     input: { ...core, metadata: { [METADATA_NAMESPACE]: { ...namespace, contentHash } } },

@@ -313,6 +313,27 @@ describe('mapVariant', () => {
     expect((mapped.input.metadata as any)[METADATA_NAMESPACE].rejectedSku).toBe('BEANIE 1/RED')
   })
 
+  it('drops a sku another product already owns but keeps the variant, recording the clash', () => {
+    // core enforces UNIQUE(org, tenant, sku) on variants; Shopify lets the same sku repeat across
+    // products. The importer detects the clash and passes the conflicting product in.
+    const mapped = mapVariant(variant({ sku: 'DUP-1' }), 'local-product-1', SCOPE, {
+      skuConflictProductId: 'local-product-2',
+    })
+
+    expect(mapped.sku).toBeNull()
+    expect(mapped.input).not.toHaveProperty('sku')
+    const ns = (mapped.input.metadata as any)[METADATA_NAMESPACE]
+    expect(ns.rejectedSku).toBe('DUP-1')
+    expect(ns.skuConflictProductId).toBe('local-product-2')
+  })
+
+  it('excludes the conflicting product id from the hash, like the local product id', () => {
+    // The conflicting product's local id differs between installs; it must not churn the hash.
+    const a = mapVariant(variant({ sku: 'DUP-1' }), 'p', SCOPE, { skuConflictProductId: 'other-a' })
+    const b = mapVariant(variant({ sku: 'DUP-1' }), 'p', SCOPE, { skuConflictProductId: 'other-b' })
+    expect(a.contentHash).toBe(b.contentHash)
+  })
+
   it('keeps money as the exact string Shopify sent', () => {
     const mapped = mapVariant(variant({ price: '1.10', compareAtPrice: '2.00' }), 'p', SCOPE)
     const namespace = (mapped.input.metadata as any)[METADATA_NAMESPACE]

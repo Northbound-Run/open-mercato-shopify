@@ -155,6 +155,14 @@ export type ProductsRuntime = {
   findPriceKindByCode(code: string): Promise<EntityRow | null>
   /** Live variants of one product — the left-hand side of per-product reconciliation. */
   findVariantsByProductId(productLocalId: string): Promise<EntityRow[]>
+  /**
+   * The local id of a DIFFERENT product that already holds `sku`, or null when the SKU is free or
+   * belongs to `productLocalId`. core enforces UNIQUE(org, tenant, sku) on variants, so a SKU Shopify
+   * repeats across products can live under only one of them; this detects that clash so the importer
+   * can drop the colliding SKU instead of failing the item on core's constraint. A detector — never a
+   * resolver (resolving a variant by SKU tenant-wide is what re-parented variants pre-0.4.4).
+   */
+  findVariantSkuConflict(sku: string, productLocalId: string): Promise<string | null>
   /** Local ids this integration has mapped for an entity type. Ownership-gated by construction. */
   listOwnedLocalIds(entityType: string): Promise<string[]>
   /**
@@ -511,7 +519,26 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
     node: ShopifyProductNode,
     ctx: RunContext,
   ): Promise<{ items: ImportItem[]; localId: string | null }> {
-    const mapped = mapVariant(variant, productLocalId, ctx.scope)
+    let mapped = mapVariant(variant, productLocalId, ctx.scope)
+
+    // Cross-product SKU collision guard. Shopify allows the same SKU on variants of different
+    // products, but core enforces UNIQUE(org, tenant, sku), so sending a SKU another product already
+    // holds would fail the whole item on that constraint and the variant would never be created.
+    // Detect the clash and re-map with the SKU dropped: the variant is still created under its own
+    // product, the drop is recorded on the row (rejectedSku + skuConflictProductId), and the item
+    // carries `skuConflict` so the collision surfaces in the run rather than a variant silently
+    // vanishing. Costs one indexed read per SKU'd variant; the drop is self-healing — once the other
+    // product releases the SKU, a later run restores it.
+    let skuConflict: { droppedSku: string; conflictingProductLocalId: string } | null = null
+    if (mapped.sku !== null) {
+      const conflictingProductLocalId = await ctx.runtime.findVariantSkuConflict(mapped.sku, productLocalId)
+      if (conflictingProductLocalId !== null) {
+        skuConflict = { droppedSku: mapped.sku, conflictingProductLocalId }
+        mapped = mapVariant(variant, productLocalId, ctx.scope, {
+          skuConflictProductId: conflictingProductLocalId,
+        })
+      }
+    }
 
     const outcome = await ctx.runtime.writer.upsert({
       externalId: variant.id,
@@ -529,7 +556,7 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
         readContentHash(row) === mapped.contentHash ? null : mapped.input,
     })
 
-    const items = [toImportItem(outcome, { productLocalId })]
+    const items = [toImportItem(outcome, skuConflict ? { productLocalId, skuConflict } : { productLocalId })]
     if (!outcome.ok) return { items, localId: null }
 
     items.push(...(await importPrices(variant, outcome.localId, node, ctx)))
