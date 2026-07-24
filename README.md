@@ -167,6 +167,12 @@ never has to touch this connector's snapshot table:
 | `cf:days_out_of_stock_90d` | days out of stock over the window |
 | `cf:unit_cost` | Shopify's `unitCost` — unblocks margin/P&L |
 
+The matching field definitions ship with the module (`ce.ts`) and are installed per tenant by the
+host's entity install — module setup, or `yarn mercato entities install-from-ce`. They are declared
+read-only in generated forms: the sync overwrites them on every run, so an edit made in the admin UI
+would silently revert. **If these fields are blank after a successful inventory run, check that the
+install has been run** — a write to an undeclared custom field is a no-op that reports no error.
+
 > **The ratio is guarded.** History cannot be backfilled — it accrues forward only — so a fresh
 > install has no valid ratio for ~90 days. Below a minimum of 14 observed days and 50% window
 > coverage, the ratio is reported as **unknown** and no custom field is written (a `0` would read as

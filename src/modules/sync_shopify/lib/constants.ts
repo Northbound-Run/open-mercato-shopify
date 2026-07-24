@@ -162,6 +162,29 @@ export const OOS_MIN_WINDOW_COVERAGE = 0.5
 /** Default window for the rolling custom field. */
 export const OOS_DEFAULT_WINDOW_DAYS = 90
 
+/**
+ * Custom fields written back onto `OM_ENTITY_ID.productVariant`.
+ *
+ * The `90d` suffix is pinned to `OOS_DEFAULT_WINDOW_DAYS` directly above; changing that constant
+ * without renaming these leaves the field names lying about their own window.
+ *
+ * These live here, and not beside the write in `adapters/inventory.ts`, because `ce.ts` declares
+ * the matching definitions from the same source and must stay importable by the host app's module
+ * generator — a leaf with no Shopify-client or bulk-export dependencies. Adding a key here without
+ * adding a definition in `ce.ts` makes the write a silent no-op; `ce.test.ts` fails if they drift.
+ */
+export const INVENTORY_CUSTOM_FIELD = {
+  unitCost: 'unit_cost',
+  oosRatio: 'oos_ratio_90d',
+  daysOutOfStock: 'days_out_of_stock_90d',
+  // Current-state on-hand and available, written on the same pass as the snapshot. These exist so a
+  // downstream consumer (e.g. a purchasing / PO-drafting module) reads current stock off a stable
+  // `cf:` seam on the native variant, and never has to reach into this connector's private snapshot
+  // table. Aggregated across the variant's locations — see `writeBackCustomFields`.
+  onHand: 'on_hand',
+  available: 'available',
+} as const
+
 /** Retention: keep daily rows this long (covers year-over-year), then roll up to monthly. */
 export const INVENTORY_DAILY_RETENTION_DAYS = 396
 

@@ -54,6 +54,7 @@ import {
 import {
   ENTITY_TYPE,
   INTEGRATION_ID,
+  INVENTORY_CUSTOM_FIELD,
   MAPPING_ENTITY_TYPE,
   OM_ENTITY_ID,
   OOS_DEFAULT_WINDOW_DAYS,
@@ -109,20 +110,11 @@ export const BULK_VARIANT_THRESHOLD = 2000
 /**
  * Custom fields written back onto `catalog:catalog_product_variant`.
  *
- * The `90d` suffix is pinned to `OOS_DEFAULT_WINDOW_DAYS`; changing that constant without renaming
- * these leaves the field names lying about their own window.
+ * Defined in `../constants` (a leaf the module's `ce.ts` can import without dragging the Shopify
+ * client into the host generator) and re-exported here, where the write actually happens, so the
+ * existing import path keeps working.
  */
-export const INVENTORY_CUSTOM_FIELD = {
-  unitCost: 'unit_cost',
-  oosRatio: 'oos_ratio_90d',
-  daysOutOfStock: 'days_out_of_stock_90d',
-  // Current-state on-hand and available, written on the same pass as the snapshot. These exist so a
-  // downstream consumer (e.g. a purchasing / PO-drafting module) reads current stock off a stable
-  // `cf:` seam on the native variant, and never has to reach into this connector's private snapshot
-  // table. Aggregated across the variant's locations — see `writeBackCustomFields`.
-  onHand: 'on_hand',
-  available: 'available',
-} as const
+export { INVENTORY_CUSTOM_FIELD } from '../constants'
 
 // ── GraphQL ─────────────────────────────────────────────────────────────────────────────────────
 
