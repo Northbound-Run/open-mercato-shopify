@@ -414,9 +414,16 @@ describe('orders runtime', () => {
 
   it('resolves a line variant under the PRODUCTS integration id, then falls back to SKU (trap 2)', async () => {
     // Mapping hit: the variant GID resolves under products, so no SKU fallback is needed.
-    const hit = makeEnv({ lookupLocalIdResult: () => 'variant-local-1' })
+    // The row is then re-read to pick up its product — see resolveVariantRef.
+    const hit = makeEnv({
+      lookupLocalIdResult: () => 'variant-local-1',
+      findOneResult: () => ({ id: 'variant-local-1', product: { id: 'product-local-1' } }),
+    })
     const runtimeHit = await build(hit)
-    expect(await runtimeHit.resolveVariantLocalId('gid://shopify/ProductVariant/9', 'SKU-9')).toBe('variant-local-1')
+    expect(await runtimeHit.resolveVariantRef('gid://shopify/ProductVariant/9', 'SKU-9')).toEqual({
+      variantId: 'variant-local-1',
+      productId: 'product-local-1',
+    })
     const mappingCall = last(hit.lookupLocalIdCalls)
     expect(mappingCall.integrationId).toBe(INTEGRATION_ID.products)
     expect(mappingCall.integrationId).not.toBe(INTEGRATION_ID.orders)
@@ -425,7 +432,10 @@ describe('orders runtime', () => {
     // Mapping miss: falls back to a scoped SKU lookup on the variant (deletedAt IS present there).
     const miss = makeEnv({ findOneResult: () => ({ id: 'variant-by-sku' }) })
     const runtimeMiss = await build(miss)
-    expect(await runtimeMiss.resolveVariantLocalId('gid://shopify/ProductVariant/9', 'SKU-9')).toBe('variant-by-sku')
+    expect(await runtimeMiss.resolveVariantRef('gid://shopify/ProductVariant/9', 'SKU-9')).toEqual({
+      variantId: 'variant-by-sku',
+      productId: null,
+    })
     expect(last(miss.findOneCalls).entity).toBe('CatalogProductVariant')
     expect(last(miss.findOneCalls).where).toEqual({
       sku: 'SKU-9',

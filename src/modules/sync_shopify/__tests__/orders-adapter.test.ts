@@ -183,10 +183,14 @@ function makeHarness(options: HarnessOptions = {}) {
     },
     readOrder: async (localId) => findOne('SalesOrder', { id: localId, deletedAt: null }, undefined, SCOPE),
     findOrderByExternalReference: async (ref) => findOne('SalesOrder', { externalReference: ref, deletedAt: null }, undefined, SCOPE),
-    resolveVariantLocalId: async (variantExternalId, sku) => {
-      if (variantExternalId && options.variants?.[variantExternalId]) return options.variants[variantExternalId]
-      if (sku && options.variantsBySku?.[sku]) return options.variantsBySku[sku]
-      return null
+    // Mirrors the real runtime: resolving a variant also yields the PRODUCT it belongs
+    // to, because core stores product_id on the line separately from product_variant_id.
+    resolveVariantRef: async (variantExternalId: string | null, sku: string | null) => {
+      const id =
+        (variantExternalId && options.variants?.[variantExternalId]) ||
+        (sku && options.variantsBySku?.[sku]) ||
+        null
+      return id ? { variantId: id, productId: `prod-of-${id}` } : null
     },
     resolveCustomerLocalId: async (gid) => options.customers?.[gid] ?? null,
     resolveCustomerLocalIdByEmail: async (email) => options.customersByEmail?.[email] ?? null,
@@ -531,6 +535,7 @@ describe('order upsert routes lines and adjustments inline for atomic totals', (
     expect(create.input.customerEntityId).toBe('cust-local-1')
     const lines = create.input.lines as Record<string, unknown>[]
     expect(lines[0].productVariantId).toBe('variant-local-1')
+    expect(lines[0].productId).toBe('prod-of-variant-local-1')
     expect(lines[0].unitPriceNet).toBe('20')
     const adjustments = create.input.adjustments as Record<string, unknown>[]
     expect(adjustments.find((a) => a.kind === 'discount')).toMatchObject({ code: 'FIVE', amountNet: '5', amountGross: '5' })
@@ -543,6 +548,32 @@ describe('order upsert routes lines and adjustments inline for atomic totals', (
     await runBackfill(harness, [orderNode()])
     const lines = harness.commandCalls.find((c) => c.commandId === COMMAND.orderCreate)!.input.lines as Record<string, unknown>[]
     expect(lines[0].productVariantId).toBe('variant-by-sku')
+  })
+
+  /**
+   * The defect this closes: every line ever written carried product_variant_id and a
+   * NULL product_id — 6,196 of 6,337 in production — because buildLineInput only ever
+   * sent the variant. core stores the two separately and the admin reads the product,
+   * so correctly-matched lines rendered as unmatched.
+   */
+  it('🔴 sends productId alongside productVariantId, not instead of it', async () => {
+    const harness = makeHarness({ variantsBySku: { 'HAT-1': 'variant-by-sku' } })
+    await runBackfill(harness, [orderNode()])
+    const lines = harness.commandCalls.find((c) => c.commandId === COMMAND.orderCreate)!.input.lines as Record<string, unknown>[]
+    expect(lines[0].productVariantId).toBe('variant-by-sku')
+    expect(lines[0].productId).toBe('prod-of-variant-by-sku')
+  })
+
+  it('omits productId when the variant has no product rather than sending null', async () => {
+    // A variant whose product cannot be resolved must not blank the column with an
+    // explicit null — core treats an absent key as "leave alone".
+    const harness = makeHarness() // no variant mappings at all
+    await runBackfill(
+      harness,
+      [orderNode({ lineItems: { nodes: [orderLine({ variant: { id: 'gid://shopify/ProductVariant/gone', sku: null }, sku: null })] } })],
+    )
+    const lines = harness.commandCalls.find((c) => c.commandId === COMMAND.orderCreate)!.input.lines as Record<string, unknown>[]
+    expect('productId' in lines[0]).toBe(false)
   })
 
   it('records an unresolvable variant without dropping the line or fabricating a variant', async () => {

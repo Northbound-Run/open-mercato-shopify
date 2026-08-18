@@ -425,6 +425,7 @@ export async function createOrdersRuntime(
   })
 
   const variantBySku = writer.naturalKeyLookup(E.variant, 'sku')
+  const variantById = writer.rowReader(E.variant)
   // Customer email natural-key lookup, for the order→customer link when the GID mapping is absent.
   // Scoped org+tenant by the writer (no integration id — the customer is resolved by its own natural
   // key, not by a mapping). Goes through `findOne` = `findOneWithDecryption`, so an encrypted
@@ -452,7 +453,8 @@ export async function createOrdersRuntime(
     // 🔴 TRAP 2: the variant was mapped by the PRODUCTS sync, so resolve its local id under
     // `INTEGRATION_ID.products` — resolving under orders' own id would always miss. Fall back to the
     // local variant's SKU (a natural key that heals a variant whose GID mapping is absent).
-    resolveVariantLocalId: async (variantExternalId, sku) => {
+    resolveVariantRef: async (variantExternalId, sku) => {
+      let row: EntityRow | null = null
       if (variantExternalId) {
         const localId = await run.mappingService.lookupLocalId(
           INTEGRATION_ID.products,
@@ -460,13 +462,15 @@ export async function createOrdersRuntime(
           variantExternalId,
           scope,
         )
-        if (localId) return localId
+        // Re-read the row rather than returning the mapped id straight through: the
+        // order line needs the variant's PRODUCT as well, and core stores that only on
+        // the variant. Without it every line lands with product_id NULL and the admin
+        // renders the line as unmatched even though the variant resolved correctly.
+        if (localId) row = await variantById(localId)
       }
-      if (sku) {
-        const row = await variantBySku(sku)
-        if (row) return row.id
-      }
-      return null
+      if (!row && sku) row = await variantBySku(sku)
+      if (!row) return null
+      return { variantId: String(row.id), productId: refId(row.product) }
     },
     // 🔴 TRAP 2: the customer was mapped by the CUSTOMERS sync — resolve under `INTEGRATION_ID.customers`.
     resolveCustomerLocalId: (customerExternalId) =>

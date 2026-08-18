@@ -112,7 +112,18 @@ export type OrderSyncRuntime = {
    * The lookup is partitioned by `INTEGRATION_ID.products` — the variant was mapped by the products
    * sync, so resolving it under this integration would always miss.
    */
-  resolveVariantLocalId(variantExternalId: string | null, sku: string | null): Promise<string | null>
+  /**
+   * The local variant AND the product it belongs to.
+   *
+   * Both are needed: core stores `product_id` on the order line separately from
+   * `product_variant_id`, and only the variant knows which product it belongs to.
+   * Returning just the variant id leaves every line with a null product, which the
+   * admin renders as an unmatched line even though the variant resolved fine.
+   */
+  resolveVariantRef(
+    variantExternalId: string | null,
+    sku: string | null,
+  ): Promise<{ variantId: string; productId: string | null } | null>
   /** Resolve a Shopify customer GID to a local `CustomerEntity` id, under `INTEGRATION_ID.customers`. */
   resolveCustomerLocalId(customerExternalId: string): Promise<string | null>
   /**
@@ -476,13 +487,13 @@ async function buildOrderInput(
 ): Promise<Record<string, unknown>> {
   const lines: Record<string, unknown>[] = []
   for (const line of mapped.lines) {
-    const variantLocalId = await runtime.resolveVariantLocalId(line.variantExternalId, line.sku)
-    if (line.variantExternalId !== null && variantLocalId === null) {
+    const ref = await runtime.resolveVariantRef(line.variantExternalId, line.sku)
+    if (line.variantExternalId !== null && ref === null) {
       // Recorded, never dropped and never fabricated: the line is kept with no variant so the order
       // still reconciles and the missing variant is visible in the line metadata.
       notes.push('variant_unresolved')
     }
-    lines.push(buildLineInput(line, variantLocalId))
+    lines.push(buildLineInput(line, ref))
   }
 
   const adjustments = mapped.adjustments.map((adj) => ({
@@ -524,7 +535,10 @@ async function buildOrderInput(
   }
 }
 
-function buildLineInput(line: MappedOrderLine, variantLocalId: string | null): Record<string, unknown> {
+function buildLineInput(
+  line: MappedOrderLine,
+  ref: { variantId: string; productId: string | null } | null,
+): Record<string, unknown> {
   return {
     kind: 'product',
     name: line.name,
@@ -532,7 +546,9 @@ function buildLineInput(line: MappedOrderLine, variantLocalId: string | null): R
     currencyCode: line.currencyCode,
     unitPriceNet: line.unitPriceNet,
     taxAmount: line.taxAmount,
-    ...(variantLocalId ? { productVariantId: variantLocalId } : {}),
+    ...(ref ? { productVariantId: ref.variantId } : {}),
+    // Sent alongside the variant, never instead of it. core's line schema carries both.
+    ...(ref?.productId ? { productId: ref.productId } : {}),
     metadata: { shopify: line.metadata },
   }
 }
