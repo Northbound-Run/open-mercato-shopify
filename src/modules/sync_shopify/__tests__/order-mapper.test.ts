@@ -1,4 +1,5 @@
 import {
+  toDateOnly,
   formatMoney,
   mapAddressSnapshot,
   mapOrder,
@@ -213,13 +214,79 @@ describe('order header mapping', () => {
     expect(mapped.header.shippingAddressSnapshot).toMatchObject({ name: 'Ada Byron', country: 'United Kingdom' })
   })
 
-  it('sets placedAt from processedAt and currency from the order', () => {
-    expect(mapped.header.placedAt).toBe('2026-07-15T09:01:00Z')
+  it('sets placedAt from processedAt as a DATE, and currency from the order', () => {
+    // Core validates placedAt against /^\d{4}-\d{2}-\d{2}$/ and rejects an instant outright,
+    // taking the whole order with it. The header carries the day…
+    expect(mapped.header.placedAt).toBe('2026-07-15')
+    // …while the mapped order keeps the full timestamp for hashing and comparison.
+    expect(mapped.placedAt).toBe('2026-07-15T09:01:00Z')
     expect(mapped.currencyCode).toBe('USD')
   })
 
   it('throws only when the currency is unusable', () => {
     expect(() => mapOrder(orderNode({ currencyCode: null }))).toThrow(OrderMappingError)
+  })
+})
+
+/**
+ * Faire posts its commission and payment-processing fee as NEGATIVE-priced line items. Core rejects
+ * `unitPriceNet` below zero, so every such order was lost outright — which is what made Jenny
+ * Krauss's entire wholesale channel invisible. A negative line is a deduction, not a line.
+ */
+describe('negative-priced line items (marketplace fees)', () => {
+  const faireOrder = () =>
+    orderNode({
+      lines: [
+        line({ id: 'gid://shopify/LineItem/1', qty: 2, unit: '34.50' }),
+        line({ id: 'gid://shopify/LineItem/2', qty: 1, unit: '-46.80', sku: 'FAIRE-COMMISSION' }),
+        line({ id: 'gid://shopify/LineItem/3', qty: 1, unit: '-11.22', sku: 'FAIRE-PAYMENT-PROCESSING-FEE' }),
+      ],
+    })
+
+  it('keeps negative lines out of `lines`, so core never sees a negative unit price', () => {
+    const mapped = mapOrder(faireOrder())
+    expect(mapped.lines).toHaveLength(1)
+    for (const l of mapped.lines) expect(Number(l.unitPriceNet)).toBeGreaterThanOrEqual(0)
+  })
+
+  it('re-expresses each one as a discount adjustment of the same magnitude', () => {
+    const mapped = mapOrder(faireOrder())
+    const fees = mapped.adjustments.filter((a) => a.metadata?.reason === 'negative_line_item')
+    expect(fees).toHaveLength(2)
+    expect(fees.map((f) => f.amount).sort()).toEqual(['11.22', '46.8'].sort())
+    for (const f of fees) expect(f.kind).toBe('discount')
+  })
+
+  it('multiplies by quantity — a fee line of 2 deducts twice', () => {
+    const mapped = mapOrder(
+      orderNode({ lines: [line({ id: 'gid://shopify/LineItem/9', qty: 2, unit: '-5.00', sku: 'FEE' })] }),
+    )
+    const fee = mapped.adjustments.find((a) => a.metadata?.reason === 'negative_line_item')
+    expect(fee?.amount).toBe('10')
+  })
+
+  it('flags the substitution so it is never silent', () => {
+    expect(mapOrder(faireOrder()).notes).toContain('negative_lines_as_adjustments')
+  })
+
+  it('leaves an all-positive order untouched', () => {
+    const mapped = mapOrder(orderNode())
+    expect(mapped.lines).toHaveLength(1)
+    expect(mapped.adjustments.some((a) => a.metadata?.reason === 'negative_line_item')).toBe(false)
+    expect(mapped.notes).not.toContain('negative_lines_as_adjustments')
+  })
+})
+
+describe('toDateOnly', () => {
+  it('reduces an instant to its UTC calendar day', () => {
+    expect(toDateOnly('2026-07-15T09:01:00Z')).toBe('2026-07-15')
+  })
+  it('passes an already-date-only value through', () => {
+    expect(toDateOnly('2026-07-15')).toBe('2026-07-15')
+  })
+  it('returns null rather than an invalid date core would reject', () => {
+    expect(toDateOnly(null)).toBeNull()
+    expect(toDateOnly('not a date')).toBeNull()
   })
 })
 

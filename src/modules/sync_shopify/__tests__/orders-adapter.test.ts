@@ -654,13 +654,22 @@ describe('read-only children (payments, shipments)', () => {
       fulfillments: [{ id: 'gid://shopify/Fulfillment/1', status: 'SUCCESS', displayStatus: 'FULFILLED', createdAt: '2026-07-16T10:00:00Z', trackingInfo: [{ company: 'UPS', number: '1Z' }] }],
     })
 
-  it('creates a payment and a shipment via the execute port and maps them by GID', async () => {
+  it('creates a payment, and does NOT attempt a shipment', async () => {
     const harness = makeHarness()
     await runBackfill(harness, [withChildren()])
     expect(harness.commandCalls.filter((c) => c.commandId === COMMAND.paymentCreate)).toHaveLength(1)
-    expect(harness.commandCalls.filter((c) => c.commandId === COMMAND.shipmentCreate)).toHaveLength(1)
     expect(harness.mappings.get(`${MAPPING_ENTITY_TYPE.salesPayment}::gid://shopify/OrderTransaction/1`)).toBe('pay-2')
-    expect(harness.mappings.get(`${MAPPING_ENTITY_TYPE.salesShipment}::gid://shopify/Fulfillment/1`)).toBe('ship-3')
+
+    // `sales.shipments.create` requires `items` — local order-line ids with quantities — which this
+    // adapter has never had; the mapper records fulfilled lines by Shopify GID for exactly that
+    // reason. Every create therefore failed with "Add at least one line to ship", and the failure
+    // propagated and took the ORDER with it, which made every pre-fulfilled marketplace order
+    // unimportable. Until line ids can be resolved, no shipment is dispatched at all.
+    //
+    // These assertions previously claimed a shipment was created. They passed only because this
+    // harness stubs the command without core's validation — the contract they were protecting had
+    // never once held in production.
+    expect(harness.commandCalls.filter((c) => c.commandId === COMMAND.shipmentCreate)).toHaveLength(0)
   })
 
   it('does not re-create a child already mapped (idempotent under re-run)', async () => {
@@ -672,7 +681,6 @@ describe('read-only children (payments, shipments)', () => {
     await runBackfill(harness, [withChildren()])
     // The order updates (no hash store match here because metadata differs), but children are skipped.
     expect(harness.commandCalls.filter((c) => c.commandId === COMMAND.paymentCreate).length).toBe(1)
-    expect(harness.commandCalls.filter((c) => c.commandId === COMMAND.shipmentCreate).length).toBe(1)
     expect(harness.commandCalls.length).toBeLessThan(before * 2)
   })
 
@@ -681,9 +689,15 @@ describe('read-only children (payments, shipments)', () => {
     const batches = await runBackfill(harness, [withChildren()])
     const failed = items(batches).find((i) => i.action === 'failed')
     expect(failed?.externalId).toBe('gid://shopify/OrderTransaction/1')
-    // The order and the shipment still landed.
+    // The order still landed.
     expect(harness.commandCalls.some((c) => c.commandId === COMMAND.orderCreate)).toBe(true)
-    expect(harness.commandCalls.some((c) => c.commandId === COMMAND.shipmentCreate)).toBe(true)
+  })
+
+  it('a pre-fulfilled order still imports — the case that broke every Faire order', async () => {
+    const harness = makeHarness()
+    const batches = await runBackfill(harness, [withChildren()])
+    expect(harness.commandCalls.some((c) => c.commandId === COMMAND.orderCreate)).toBe(true)
+    expect(items(batches).some((i) => i.action === 'failed')).toBe(false)
   })
 })
 

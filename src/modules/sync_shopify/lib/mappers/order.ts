@@ -188,6 +188,8 @@ export type OrderMappingNote =
   | 'discount_residual_reconciled'
   | 'tax_residual_added'
   | 'no_line_items'
+  | 'negative_lines_as_adjustments'
+  | 'shipment_skipped_no_lines'
 
 /** A line the adapter still has to resolve a `productVariantId` for before dispatch. */
 export type MappedOrderLine = {
@@ -476,6 +478,22 @@ function buildDiscountAdjustments(
  * whose price cannot be read is still returned with a zero price and a note rather than dropped: an
  * order missing a line reconciles to the wrong total silently, which is worse than a visible zero.
  */
+/**
+ * The calendar day of an ISO instant, in UTC. Null in, null out; unparseable in, null out.
+ *
+ * UTC rather than store-local on purpose: the value feeds a date-only column used for
+ * trailing-window reporting, where a boundary order landing on the adjacent day is immaterial,
+ * whereas a timezone lookup here would couple the pure mapper to shop settings it cannot see.
+ */
+export function toDateOnly(value: string | null): string | null {
+  if (value === null) return null
+  const trimmed = value.trim()
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed
+  const parsed = new Date(trimmed)
+  if (Number.isNaN(parsed.getTime())) return null
+  return parsed.toISOString().slice(0, 10)
+}
+
 function mapLine(
   line: ShopifyOrderLine,
   currencyCode: string,
@@ -686,18 +704,44 @@ export function mapOrder(node: ShopifyOrderNode): MappedOrder {
   // Lines at original net, carrying their own tax.
   const rawLines = (node.lineItems?.nodes ?? []).filter((l): l is ShopifyOrderLine => l != null)
   const lines: MappedOrderLine[] = []
+  // A NEGATIVE-priced line is not a line: core rejects `unitPriceNet` below zero and drops the
+  // whole order. Marketplace channels use them as deductions — Faire posts FAIRE-COMMISSION and
+  // FAIRE-PAYMENT-PROCESSING-FEE this way — so they belong in order-level adjustments, which is
+  // where this mapper already puts every other deduction. Held aside here, emitted as discounts
+  // below, so the grand total still reconciles to Shopify's figure exactly.
+  const negativeLines: { label: string; code: string | null; amount: bigint; sku: string | null }[] = []
   let lineTaxTotal = 0n
   for (const raw of rawLines) {
     const mapped = mapLine(raw, currencyCode, notes)
-    if (mapped) {
-      lines.push(mapped)
-      lineTaxTotal += scaleMoney(mapped.taxAmount) ?? 0n
+    if (!mapped) continue
+    const unit = scaleMoney(mapped.unitPriceNet)
+    if (unit !== null && unit < 0n) {
+      negativeLines.push({
+        label: mapped.name,
+        code: mapped.sku,
+        amount: -unit * BigInt(mapped.quantity),
+        sku: mapped.sku,
+      })
+      continue
     }
+    lines.push(mapped)
+    lineTaxTotal += scaleMoney(mapped.taxAmount) ?? 0n
   }
+  if (negativeLines.length > 0) notes.push('negative_lines_as_adjustments')
   if (lines.length === 0) notes.push('no_line_items')
 
   // Order-level adjustments: discounts (Σ = D), shipping (= S), residual tax (= X − Σ line tax).
   const adjustments: MappedOrderAdjustment[] = []
+  for (const negative of negativeLines) {
+    adjustments.push({
+      kind: 'discount',
+      label: clamp(negative.label, MAX_LABEL),
+      code: negative.code,
+      amount: formatMoney(negative.amount),
+      position: adjustments.length,
+      metadata: { reason: 'negative_line_item', sku: negative.sku },
+    })
+  }
   adjustments.push(...buildDiscountAdjustments(node, discount, notes, adjustments.length))
   if (shipping > 0n) {
     adjustments.push({
@@ -725,6 +769,11 @@ export function mapOrder(node: ShopifyOrderNode): MappedOrder {
   }
 
   const placedAt = text(node.processedAt) ?? text(node.createdAt)
+  // Core's document command validates `placedAt` against a DATE-ONLY schema
+  // (`/^\d{4}-\d{2}-\d{2}$/`), so an ISO instant is rejected outright with `invalid_date` and the
+  // whole order is lost. Shopify hands us an instant, so the header carries the calendar day and
+  // `MappedOrder.placedAt` keeps the full timestamp for hashing and comparison.
+  const placedOnDay = toDateOnly(placedAt)
   const financialStatus = text(node.displayFinancialStatus)
   const fulfillmentStatus = text(node.displayFulfillmentStatus)
   const orderNumber = text(node.name)
@@ -763,7 +812,7 @@ export function mapOrder(node: ShopifyOrderNode): MappedOrder {
     externalReference: node.id,
     orderNumber: orderNumber ?? undefined,
     currencyCode,
-    placedAt: placedAt ?? undefined,
+    placedAt: placedOnDay ?? undefined,
     billingAddressSnapshot: billingSnapshot ?? undefined,
     shippingAddressSnapshot: shippingSnapshot ?? undefined,
     comments: text(node.note) ?? undefined,
@@ -780,6 +829,9 @@ export function mapOrder(node: ShopifyOrderNode): MappedOrder {
 
   const payments = mapPayments(node, currencyCode)
   const shipments = mapShipments(node)
+  // The adapter cannot dispatch these yet — `sales.shipments.create` needs local order-line ids
+  // that do not exist at import time. Noted rather than silently dropped.
+  if (shipments.length > 0) notes.push('shipment_skipped_no_lines')
 
   const contentHash = orderContentHash({
     header,

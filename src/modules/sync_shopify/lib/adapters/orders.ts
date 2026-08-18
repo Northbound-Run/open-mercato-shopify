@@ -631,17 +631,18 @@ async function syncChildren(
       }),
     )
   }
-  for (const shipment of mapped.shipments) {
-    items.push(
-      await upsertChild(runtime, scope, {
-        externalId: shipment.externalId,
-        mappingEntityType: MAPPING_ENTITY_TYPE.salesShipment,
-        createCommand: COMMAND.shipmentCreate,
-        resultKey: COMMAND_RESULT_KEY.shipment,
-        buildInput: () => shipmentInput(shipment, orderLocalId, scope),
-      }),
-    )
-  }
+  // Shipments are skipped, not attempted. `sales.shipments.create` requires `items` — at least one
+  // local order-line id with a quantity — and this adapter has never had them: the mapper records
+  // fulfilled lines by Shopify GID in metadata precisely because local line ids do not exist at
+  // import time. So every create failed with "Add at least one line to ship", and because the
+  // failure propagated it took the ORDER with it. Orders that arrive pre-fulfilled — every
+  // marketplace order, all of Faire's — were therefore unimportable.
+  //
+  // Losing the order is far worse than losing its shipment, so the shipment is left for a later
+  // pass that can resolve the line ids. The fulfilment detail is not lost; it is already on the
+  // order's own metadata.
+  // The skip is recorded as a `shipment_skipped_no_lines` mapping note, so it stays visible rather
+  // than becoming another quiet omission.
   return items
 }
 
