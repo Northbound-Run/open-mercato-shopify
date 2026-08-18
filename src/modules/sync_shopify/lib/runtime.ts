@@ -224,6 +224,28 @@ export async function createProductsRuntime(
     readVariant: writer.rowReader(E.variant),
     // `CatalogProductPrice` has no deleted_at column — scope org + tenant only.
     readPrice: (localId) => env.findOne(run.em, E.price, scoped(scope, { id: localId }), undefined, scope),
+    // 🔴 The price upsert's ONLY defence against a lost mapping. A price has no single natural key,
+    // so `writer.naturalKeyLookup` (one field) cannot express one; its identity is core's unique key,
+    // UNIQUE(variant_id, organization_id, tenant_id, currency_code, price_kind_id, min_quantity).
+    // Without this the upsert has mapping-or-create and nothing else, so a price row whose mapping
+    // was lost is recreated on EVERY run and violates that constraint on every run — 104 identical
+    // failures on one variant before this was found, each one reported inside a `completed` run.
+    // `minQuantity` is matched (not omitted) because it is part of the key: omitting it would let a
+    // tiered row for the same variant/currency/kind be adopted and overwritten with the base price.
+    // Both sides read `PRICE_MIN_QUANTITY`, so what we look up is by construction what we create.
+    findPriceByNaturalKey: (criteria) =>
+      env.findOne(
+        run.em,
+        E.price,
+        scoped(scope, {
+          variant: criteria.variantId,
+          priceKind: criteria.priceKindId,
+          currencyCode: criteria.currencyCode,
+          minQuantity: criteria.minQuantity,
+        }),
+        undefined,
+        scope,
+      ),
     findProductByHandle: writer.naturalKeyLookup(E.product, 'handle'),
     // SKU is unique only WITHIN a product, never across the shop, so the variant natural-key fallback
     // MUST pin the product. A tenant-wide `naturalKeyLookup(E.variant, 'sku')` here lets the fallback

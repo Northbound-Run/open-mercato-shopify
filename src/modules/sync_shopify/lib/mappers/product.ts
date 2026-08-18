@@ -488,6 +488,16 @@ export function toPriceIntents(
     : [intent(PRICE_KIND_CODE.regular, price)]
 }
 
+/**
+ * The `min_quantity` every price this connector writes carries.
+ *
+ * Shopify has no quantity-break pricing, so one tier is all there is to sync. It is set EXPLICITLY
+ * rather than left to core's column default because it is part of the row's unique key — see
+ * `findPriceByNaturalKey` in `lib/runtime.ts`, which matches on this same constant. Create and
+ * lookup must agree; sourcing both from here is what guarantees they cannot drift apart.
+ */
+export const PRICE_MIN_QUANTITY = 1
+
 export function mapPrice(
   intent: PriceIntent,
   variantLocalId: string,
@@ -500,6 +510,7 @@ export function mapPrice(
     variantId: variantLocalId,
     priceKindId,
     currencyCode: intent.currencyCode,
+    minQuantity: PRICE_MIN_QUANTITY,
     // The decimal string goes through untouched: core validates digit counts on this exact text.
     unitPriceGross: intent.amount,
   }

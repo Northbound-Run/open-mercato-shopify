@@ -31,6 +31,15 @@ type WriteRecord = {
   input: Record<string, unknown>
 }
 
+/**
+ * A price row's identity per core's unique key, or null when the row is not a price. Used both to
+ * model the constraint in the writer stub and to answer `findPriceByNaturalKey` in the harness.
+ */
+function priceKeyOf(row: Record<string, unknown>): string | null {
+  if (row.variantId === undefined || row.priceKindId === undefined) return null
+  return [row.variantId, row.organizationId, row.tenantId, row.currencyCode, row.priceKindId, row.minQuantity].join('|')
+}
+
 function makeWriter(store: Store, writes: WriteRecord[]) {
   const { rows, mappings } = store
   let sequence = rows.size
@@ -74,6 +83,14 @@ function makeWriter(store: Store, writes: WriteRecord[]) {
         }
 
         const input = await spec.buildCreateInput()
+        // Core's UNIQUE(variant_id, org, tenant, currency_code, price_kind_id, min_quantity) on
+        // `catalog_product_variant_prices`, modelled. Without it this stub happily creates a
+        // duplicate price and the natural-key fallback looks optional — which is precisely the
+        // illusion under which prices shipped without one and then failed 104 times in production.
+        if (spec.mappingEntityType === 'catalog_product_price' && priceKeyOf(input) !== null) {
+          const clash = [...rows.values()].some((row) => priceKeyOf(row) === priceKeyOf(input))
+          if (clash) throw new Error('duplicate key value violates unique constraint')
+        }
         writes.push({ mappingEntityType: spec.mappingEntityType, command: 'create', input })
         const localId = `local-${++sequence}`
         rows.set(localId, { ...input, id: localId })
@@ -224,6 +241,12 @@ function makeHarness(script: ClientScript = {}, previous?: { store: Store }, ext
     readProduct: async (id) => store.rows.get(id) ?? null,
     readVariant: async (id) => store.rows.get(id) ?? null,
     readPrice: async (id) => store.rows.get(id) ?? null,
+    // Matches on core's full unique key, exactly as the real runtime does — including minQuantity,
+    // so a tiered row for the same variant/currency/kind is NOT a match and cannot be adopted.
+    findPriceByNaturalKey: async (criteria) => {
+      const wanted = priceKeyOf({ ...criteria, ...SCOPE })
+      return [...store.rows.values()].find((row) => priceKeyOf(row) === wanted) ?? null
+    },
     findProductByHandle: async () => null,
     // Product-scoped by construction, mirroring `findVariantsByProductId` below: a SKU is matched
     // only among the rows already parented to THIS product, so the fallback can never resolve to a
@@ -902,6 +925,73 @@ describe('sale lifecycle — on sale, then off sale', () => {
 
     expect(second.calls.execute).toEqual([])
     expect(pricesFor(second, VARIANT_A.id)).toEqual({ 'kind-regular': '29.00', 'kind-sale': '19.00' })
+  })
+
+  /**
+   * Production, 2026-08: 105 price writes failing on every single run, 104 of them the same
+   * variant, all inside runs that reported `completed`. The price row existed; its external-id
+   * mapping did not. With mapping-or-create and no natural key the upsert could only try to create
+   * it again, and core's unique key rejected it — forever.
+   */
+  describe('a price row whose mapping was lost', () => {
+    function orphanPriceMapping(h: Harness) {
+      const key = storeKey('catalog_product_price', `${VARIANT_A.id}:price:regular::GBP`)
+      expect(h.store.mappings.has(key)).toBe(true) // guard: the fixture must actually be mapped
+      h.store.mappings.delete(key)
+      return key
+    }
+
+    it('🔴 adopts it instead of colliding with it on every run', async () => {
+      const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) })
+      await collect(first)
+      const priceLocalId = localIdOf(first, 'catalog_product_price', `${VARIANT_A.id}:price:regular::GBP`)
+      const key = orphanPriceMapping(first)
+
+      const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [{ ...OFF_SALE, price: '31.00' }]) }, first)
+      const batches = await collect(second)
+
+      const item = items(batches).find((i) => i.externalId === `${VARIANT_A.id}:price:regular::GBP`)
+      expect(item).toMatchObject({ action: 'update', data: { resolvedVia: 'natural_key' } })
+      // The existing row was updated in place — not duplicated, not left stale.
+      expect(pricesFor(second, VARIANT_A.id)).toEqual({ 'kind-regular': '31.00' })
+      expect(second.store.rows.get(priceLocalId)).toMatchObject({ unitPriceGross: '31.00' })
+      // And the mapping is healed, so the next run resolves straight through it.
+      expect(second.store.mappings.get(key)).toBe(priceLocalId)
+    })
+
+    it('🔴 reports no failure — the run really is clean, not merely calling itself clean', async () => {
+      const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) })
+      await collect(first)
+      orphanPriceMapping(first)
+
+      const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) }, first)
+      const batches = await collect(second)
+
+      expect(items(batches).filter((i) => i.action === 'failed')).toEqual([])
+    })
+
+    it('leaves a tiered row for the same variant alone — minQuantity is part of the key', async () => {
+      const first = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) })
+      await collect(first)
+      const variantLocalId = localIdOf(first, 'catalog_product_variant', VARIANT_A.id)
+      // A wholesale break an operator set by hand: same variant, currency and kind, different tier.
+      // Matching without minQuantity would adopt THIS row and overwrite the tier with the base price.
+      first.store.rows.set('tier-10', {
+        id: 'tier-10',
+        ...SCOPE,
+        variantId: variantLocalId,
+        priceKindId: 'kind-regular',
+        currencyCode: 'GBP',
+        minQuantity: 10,
+        unitPriceGross: '21.00',
+      })
+      orphanPriceMapping(first)
+
+      const second = makeHarness({ jsonl: jsonl(PRODUCT_1, [OFF_SALE]) }, first)
+      await collect(second)
+
+      expect(second.store.rows.get('tier-10')).toMatchObject({ unitPriceGross: '21.00', minQuantity: 10 })
+    })
   })
 
   it('never deletes a price row this integration does not own', async () => {

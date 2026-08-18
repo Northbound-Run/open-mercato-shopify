@@ -40,6 +40,7 @@ import {
   PRICE_KIND_CODE,
   ProductMappingError,
   mapPrice,
+  PRICE_MIN_QUANTITY,
   mapProduct,
   mapVariant,
   priceExternalId,
@@ -137,6 +138,17 @@ export type ProductsRuntime = {
   readProduct(localId: string): Promise<EntityRow | null>
   readVariant(localId: string): Promise<EntityRow | null>
   readPrice(localId: string): Promise<EntityRow | null>
+  /**
+   * A live price matched by core's unique key rather than by our mapping. The natural-key fallback
+   * for prices: without it a price row whose external-id mapping is missing can only ever be
+   * re-created, and re-creating it violates that unique key forever.
+   */
+  findPriceByNaturalKey(criteria: {
+    variantId: string
+    priceKindId: string
+    currencyCode: string
+    minQuantity: number
+  }): Promise<EntityRow | null>
   findProductByHandle(handle: string): Promise<EntityRow | null>
   /**
    * A live variant matched by SKU **within one product**. SKU is not unique across products in
@@ -500,8 +512,19 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
         updateCommand: COMMAND.priceUpdate,
         resultKey: COMMAND_RESULT_KEY.price,
         readById: ctx.runtime.readPrice,
+        // A price's identity is core's unique key, not one column, so this is the fallback that
+        // stops a lost mapping from becoming a permanent create-and-collide loop. Every other
+        // entity here already had one (product → handle, variant → sku, customer → email); prices
+        // were the single upsert missing it, and they were the only ones failing every run.
+        findByNaturalKey: () =>
+          ctx.runtime.findPriceByNaturalKey({
+            variantId: variantLocalId,
+            priceKindId: ctx.priceKinds[intent.kindCode],
+            currencyCode: intent.currencyCode,
+            minQuantity: PRICE_MIN_QUANTITY,
+          }),
         buildCreateInput: () => input,
-        // Prices have no natural key of their own, so the stored amount is the comparison. It is
+        // Prices have no single natural key, so the stored amount is the comparison. It is
         // compared as text: `'19.90' !== 19.9` is precisely the distinction worth keeping.
         buildUpdateInput: ({ row }) =>
           String(row.unitPriceGross ?? '') === intent.amount ? null : input,

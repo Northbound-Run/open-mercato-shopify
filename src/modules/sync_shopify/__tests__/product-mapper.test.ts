@@ -6,6 +6,7 @@ import {
   computeContentHash,
   isActiveStatus,
   mapPrice,
+  PRICE_MIN_QUANTITY,
   mapProduct,
   mapVariant,
   mergeMetadata,
@@ -436,10 +437,20 @@ describe('mapPrice', () => {
       variantId: 'local-variant-1',
       priceKindId: 'kind-regular',
       currencyCode: 'GBP',
+      minQuantity: 1,
       unitPriceGross: '1.10',
     })
     // Not 1.1, and not a number.
     expect(typeof input.unitPriceGross).toBe('string')
+  })
+
+  it('sets minQuantity explicitly rather than leaning on core\'s column default', () => {
+    // It is part of the row's unique key, and `findPriceByNaturalKey` matches on it. If a create
+    // ever stopped writing it, the lookup would search for a row shape that creates no longer
+    // produce and the upsert would silently fall back to create-and-collide.
+    const [intent] = toPriceIntents(variant({ price: '1.10' }), 'GBP')
+    const input = mapPrice(intent!, 'local-variant-1', 'kind-regular', SCOPE)
+    expect(input.minQuantity).toBe(PRICE_MIN_QUANTITY)
   })
 })
 
