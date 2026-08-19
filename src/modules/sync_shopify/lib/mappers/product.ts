@@ -68,6 +68,12 @@ export type ShopifyProductNode = {
   vendor?: string | null
   tags?: string[] | null
   updatedAt?: string | null
+  /**
+   * The product's primary photo. Kept as a URL only — Shopify's CDN serves it
+   * publicly and permanently, so the drafted PO can render it with `=IMAGE(url)`
+   * without us storing a copy that would go stale the day the photo changes.
+   */
+  featuredImage?: { url?: string | null } | null
   /** ⚠ `priceRangeV2`, not the deprecated `priceRange`. Read only for its currency code. */
   priceRangeV2?: {
     maxVariantPrice?: { amount?: string | null; currencyCode?: string | null } | null
@@ -311,6 +317,7 @@ export function mapProduct(node: ShopifyProductNode, scope: MappingScope): Mappe
     productType: trimmed(node.productType),
     handle: trimmed(node.handle),
     updatedAt: trimmed(node.updatedAt),
+    featuredImageUrl: trimmed(node.featuredImage?.url),
   }
   if (description !== null && (node.descriptionHtml ?? '').trim().length > MAX_DESCRIPTION) {
     // Core's `description` column stops at 4000 characters and Shopify's HTML routinely exceeds

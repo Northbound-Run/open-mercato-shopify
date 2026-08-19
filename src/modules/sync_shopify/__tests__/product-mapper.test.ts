@@ -472,3 +472,31 @@ describe('resolveCurrencyCode', () => {
     ).toBe('USD')
   })
 })
+
+describe('featured image', () => {
+  it('🔴 keeps the primary photo URL, for the drafted PO to render', () => {
+    // Shopify's CDN is public and permanent, so the PO can use =IMAGE(url) without
+    // us storing a copy that goes stale the day the photo changes.
+    const url = 'https://cdn.shopify.com/s/files/1/0590/7018/5555/files/A_Morning_Dew_belt.jpg?v=1'
+    const mapped = mapProduct({ ...product(), featuredImage: { url } }, SCOPE)
+    const ns = (mapped.input.metadata as any).shopify
+    expect(ns.featuredImageUrl).toBe(url)
+  })
+
+  it('records null rather than an empty string when a product has no photo', () => {
+    // A blank would render =IMAGE("") as an error cell; null lets the caller omit
+    // the formula entirely.
+    for (const featuredImage of [null, undefined, { url: null }, { url: '  ' }]) {
+      const mapped = mapProduct({ ...product(), featuredImage } as any, SCOPE)
+      expect((mapped.input.metadata as any).shopify.featuredImageUrl).toBeNull()
+    }
+  })
+
+  it('🔴 changes the content hash, so an added or swapped photo actually re-syncs', () => {
+    const a = mapProduct({ ...product(), featuredImage: { url: 'https://cdn/x.jpg' } }, SCOPE)
+    const b = mapProduct({ ...product(), featuredImage: { url: 'https://cdn/y.jpg' } }, SCOPE)
+    const none = mapProduct(product(), SCOPE)
+    expect(a.contentHash).not.toBe(b.contentHash)
+    expect(a.contentHash).not.toBe(none.contentHash)
+  })
+})

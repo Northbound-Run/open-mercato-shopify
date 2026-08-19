@@ -230,6 +230,7 @@ const PRODUCT_FIELDS = `
         vendor
         tags
         updatedAt
+        featuredImage { url }
         priceRangeV2 { maxVariantPrice { amount currencyCode } }`
 
 const VARIANT_FIELDS = `
@@ -948,6 +949,9 @@ export function createShopifyProductsAdapter(deps: ProductsAdapterDeps): DataSyn
           { externalField: 'variants.selectedOptions', localField: 'variant.optionValues', mappingKind: 'core' },
           { externalField: 'variants.price', localField: 'price.unitPriceGross', mappingKind: 'relation' },
           { externalField: 'variants.compareAtPrice', localField: 'price.unitPriceGross', mappingKind: 'relation', transform: 'list price when on sale' },
+          // The full media set is still ignored; only the primary photo's URL is kept,
+          // in metadata, so a drafted PO can render it without storing a copy.
+          { externalField: 'featuredImage.url', localField: 'metadata.shopify.featuredImageUrl', mappingKind: 'metadata' },
           { externalField: 'media', localField: '', mappingKind: 'ignore' },
           { externalField: 'metafields', localField: '', mappingKind: 'ignore' },
         ],
